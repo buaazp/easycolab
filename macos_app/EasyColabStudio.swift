@@ -433,6 +433,56 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         ]
     ),
     OpenModelSpec(
+        id: "deepseek_v4_pro_qwen35_9b_heretic",
+        nameZh: "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        nameEn: "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        repoId: "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        badgeZh: "BF16 原生 · 18 GB",
+        badgeEn: "Native BF16 · 18 GB",
+        summaryZh: "基于 Qwen3.5-9B 的 DeepSeek-V4-Pro 蒸馏推理模型（Heretic 版本），支持最高 256K 上下文",
+        summaryEn: "DeepSeek-V4-Pro reasoning distillation based on Qwen3.5-9B (Heretic variant), up to 256K context",
+        approxSizeGB: 18.0,
+        icon: "brain",
+        modality: .llmVLM,
+        defaultSteps: 20,
+        modes: [
+            TaskModeItem(
+                id: "chat",
+                titleZh: "深度推理对话",
+                titleEn: "Deep Reasoning Chat",
+                subtitleZh: "支持数学、科学与多轮推理对话",
+                subtitleEn: "Mathematics, science & multi-turn reasoning chat",
+                icon: "bubble.left.and.bubble.right"
+            ),
+            TaskModeItem(
+                id: "vlm",
+                titleZh: "图像视觉理解",
+                titleEn: "Vision Understanding",
+                subtitleZh: "使用 Qwen3.5 视觉编码器进行图片理解",
+                subtitleEn: "Image understanding with the Qwen3.5 vision encoder",
+                icon: "eye"
+            ),
+            TaskModeItem(
+                id: "api",
+                titleZh: "API 协议网关",
+                titleEn: "API Protocol Gateway",
+                subtitleZh: "提供 OpenAI (/v1) 与 Anthropic (/v1/messages) 双协议公网接口",
+                subtitleEn: "Public dual-protocol gateway compatible with OpenAI (/v1) & Anthropic (/v1/messages)",
+                icon: "network"
+            )
+        ],
+        defaultFiles: (1...4).map { shard in
+            ModelFileItem(
+                name: String(format: "model-%05d-of-00004.safetensors", shard),
+                desc: "权重分片 \(shard)/4",
+                exists: false,
+                size_gb: 0
+            )
+        } + [
+            ModelFileItem(name: "model-mtp.safetensors", desc: "MTP 权重（模型索引必需文件）", exists: false, size_gb: 0)
+        ]
+    ),
+    OpenModelSpec(
         id: "qwen_image_21",
         nameZh: "Qwen-Image-2.1",
         nameEn: "Qwen-Image-2.1",
@@ -1709,9 +1759,10 @@ class StudioViewModel: ObservableObject {
     }
 
     var isQwenLoadedInVRAM: Bool {
-        loadedModelIds.contains("qwen38_27b")
-            || loadedModelIds.contains("qwen38_27b_gguf")
-            || (modelLoaded && (loadedModelId == "qwen38_27b" || loadedModelId == "qwen38_27b_gguf"))
+        OPEN_MODEL_CATALOG.contains { spec in
+            spec.modality == .llmVLM
+                && (loadedModelIds.contains(spec.id) || (modelLoaded && loadedModelId == spec.id))
+        }
     }
 
     init() {
@@ -7004,14 +7055,15 @@ struct MainStudioView: View {
         let anthropicBase = baseHost
         let displayKey = vm.apiKeyEnabled ? vm.apiAccessKey : "sk-no-key-required"
         let activeLLMRepo: String = {
-            if vm.selectedModelId == "qwen38_27b_gguf" { return "unsloth/Qwen3.8-27B-GGUF" }
-            if vm.selectedModelId == "qwen38_27b" { return "Qwen/Qwen3.8-27B" }
-            if vm.loadedModelIds.contains("qwen38_27b_gguf") && !vm.loadedModelIds.contains("qwen38_27b") {
-                return "unsloth/Qwen3.8-27B-GGUF"
+            if vm.activeModelSpec.modality == .llmVLM { return vm.activeModelSpec.repoId }
+            if let loadedLLM = OPEN_MODEL_CATALOG.first(where: {
+                $0.modality == .llmVLM && vm.loadedModelIds.contains($0.id)
+            }) {
+                return loadedLLM.repoId
             }
             return "Qwen/Qwen3.8-27B"
         }()
-        let activeLLMDisplayName = activeLLMRepo.contains("GGUF") ? "Qwen3.8-27B-GGUF" : "Qwen3.8-27B"
+        let activeLLMDisplayName = String(activeLLMRepo.split(separator: "/").last ?? "")
 
         let samplePrompt1 = L("用三句话解释量子纠缠，并展示思考过程", "Explain quantum entanglement in 3 sentences with reasoning")
         let samplePrompt2 = L("帮我设计一个高并发网关架构", "Design a high-concurrency API gateway architecture")

@@ -1245,8 +1245,14 @@ def setup_colab_ramdisk() -> Optional[str]:
 
 RAM_ROOT_DIR = setup_colab_ramdisk()
 
-# 如果挂载了 Google Drive，优先将模型持久化保存在云盘 EasyColab_Models（并自动兼容读取历史 Aevix_Models / MiniMax_H3_Models 目录）
-DRIVE_MOUNTED = os.path.exists("/content/drive/MyDrive")
+
+def _google_drive_is_mounted() -> bool:
+    return os.path.isdir("/content/drive/MyDrive") and (
+        os.path.ismount("/content/drive") or os.path.ismount("/content/drive/MyDrive")
+    )
+
+
+DRIVE_MOUNTED = _google_drive_is_mounted()
 
 
 def _has_rclone_drive_remote() -> bool:
@@ -1284,13 +1290,30 @@ COMFYUI_STATE: Dict[str, Any] = {
     "comfy_proc": None,
     "tunnel_proc": None,
 }
-MODEL_BASE_ROOT = (
-    "/content/drive/MyDrive/EasyColab_Models"
-    if DRIVE_MOUNTED
-    else os.path.join(os.getcwd(), "models")
-)
+
+
+def _resolve_model_base_root() -> str:
+    if not DRIVE_MOUNTED:
+        if os.environ.get("EASYCOLAB_REQUIRE_DRIVE", "0") == "1":
+            raise RuntimeError("Google Drive 尚未成功挂载，请先运行笔记本的挂载步骤，再启动服务端。")
+        return os.path.join(os.getcwd(), "models")
+    configured = (
+        os.environ.get("EASYCOLAB_MODEL_DIR")
+        or os.environ.get("DIFFSYNTH_MODEL_BASE_PATH")
+        or "/content/drive/MyDrive/models"
+    )
+    model_root = os.path.realpath(os.path.expanduser(configured))
+    drive_root = os.path.realpath("/content/drive/MyDrive")
+    if os.path.commonpath([drive_root, model_root]) != drive_root or model_root == drive_root:
+        raise ValueError("EASYCOLAB_MODEL_DIR 必须是 /content/drive/MyDrive 下的模型子目录。")
+    return model_root
+
+
+MODEL_BASE_ROOT = _resolve_model_base_root()
 LEGACY_DRIVE_MODEL_ROOT = "/content/drive/MyDrive/MiniMax_H3_Models"
 LEGACY_DRIVE_MODEL_ROOTS = [
+    "/content/drive/MyDrive/EasyColab_Models",
+    "/content/drive/MyDrive/models",
     "/content/drive/MyDrive/Aevix_Models",
     "/content/drive/MyDrive/MiniMax_H3_Models",
 ]
@@ -1322,6 +1345,7 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         "modality": "video_audio",
         "category": "全模态音视频生成 · BF16 原生满血 · 32kHz 立体声",
         "approx_size_gb": 134.1,
+        "metadata_subdir": "FL2VA/processor",
         "files": MINIMAX_H3_BF16_FILES,
     },
     "qwen38_27b": {
@@ -1349,6 +1373,18 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
             ("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "Unsloth MTP 多词元并行投机解码头 (约 1.31 GB)"),
         ],
     },
+    "deepseek_v4_pro_qwen35_9b_heretic": {
+        "id": "deepseek_v4_pro_qwen35_9b_heretic",
+        "name": "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        "repo_id": "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        "modality": "llm_vlm",
+        "category": "Qwen3.5-9B 蒸馏推理 · Heretic · BF16 原生",
+        "approx_size_gb": 18.0,
+        "files": [
+            (f"model-{shard:05d}-of-00004.safetensors", f"权重分片 {shard}/4")
+            for shard in range(1, 5)
+        ] + [("model-mtp.safetensors", "MTP 权重（模型索引必需文件）")],
+    },
     "qwen_image_21": {
         "id": "qwen_image_21",
         "name": "Qwen-Image-2.1",
@@ -1356,6 +1392,7 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         "modality": "image",
         "category": "旗舰文生图与多图指令修图",
         "approx_size_gb": 30.9,
+        "metadata_subdir": "processor",
         "files": [
             ("transformer/diffusion_pytorch_model-00001-of-00002.safetensors", "DiT 图像主干 1/2"),
             ("transformer/diffusion_pytorch_model-00002-of-00002.safetensors", "DiT 图像主干 2/2"),
@@ -1373,6 +1410,7 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         "modality": "image",
         "category": "8 步极速超清写实与中英文字生图",
         "approx_size_gb": 30.6,
+        "metadata_subdir": "tokenizer",
         "files": [
             ("transformer/diffusion_pytorch_model-00001-of-00003.safetensors", "Z-Image DiT 主干 1/3"),
             ("transformer/diffusion_pytorch_model-00002-of-00003.safetensors", "Z-Image DiT 主干 2/3"),
@@ -1503,6 +1541,8 @@ def fast_parallel_hf_download(
             for fut in as_completed(futures):
                 fut.result()
 
+        if downloaded_bytes != total_size:
+            raise IOError(f"下载字节数不完整: {filename} ({downloaded_bytes}/{total_size})")
         os.replace(temp_path, dest_path)
         return dest_path
 
@@ -1650,6 +1690,15 @@ def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
     return None
 
 
+def _model_directory_ready(model_id: str, model_dir: str) -> bool:
+    return _model_metadata_ready(model_id, model_dir) and all(
+        os.path.isfile(os.path.join(model_dir, filename))
+        and not os.path.islink(os.path.join(model_dir, filename))
+        and os.path.getsize(os.path.join(model_dir, filename)) > 64 * 1024
+        for filename, description in MODEL_CATALOG[model_id]["files"]
+    )
+
+
 def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
     """检查指定开源模型在内存盘/磁盘/云盘上的权重文件完整性与大小"""
     target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
@@ -1696,10 +1745,12 @@ def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
         "total_count": len(req_files),
         "all_downloaded": all_downloaded,
         "total_size_gb": round(total_size_gb, 2),
-        "drive_persisted": DRIVE_MOUNTED,
+        "drive_mounted": DRIVE_MOUNTED and _google_drive_is_mounted(),
+        "drive_persisted": DRIVE_MOUNTED and _google_drive_is_mounted() and _model_directory_ready(target_id, drive_dir),
         "ramdisk_enabled": ram_dir is not None,
         "ram_cached_count": ram_cached_count,
-        "model_storage_path": ram_dir or drive_dir,
+        "model_storage_path": drive_dir if DRIVE_MOUNTED else nvme_dir,
+        "model_cache_path": ram_dir or nvme_dir,
         "bf16_shards_count": downloaded_count if target_id == "minimax_h3" else 0,
     }
 
@@ -1921,8 +1972,6 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
     ):
         base[k] = hw.get(k, 0.0)
     base.update(file_status)
-    if _has_rclone_drive_remote():
-        base["drive_persisted"] = True
     base["comfyui"] = get_comfyui_status_dict()
     return base
 
@@ -1990,24 +2039,85 @@ def build_structured_prompt(
 
 
 # ==============================================================================
-# 独立功能 1：多模型通用极速下载器 (8路并发 HTTP Range + 后台 Google Drive 备份)
+# 独立功能 1：多模型通用极速下载器 (8路并发 HTTP Range + 完整 Google Drive 持久化)
 # ==============================================================================
-def _async_backup_to_drive(src_file: str, dst_dir: str, fname: str):
-    """在后台线程中将内存盘/NVMe下载好的权重同步到 Google Drive，不阻塞用户加载模型"""
-    if not DRIVE_MOUNTED:
+def _copy_model_file(src_file: str, dst_dir: str, fname: str):
+    """将已有缓存原子复制为目标目录中的真实文件，不保留指向临时盘的软链接。"""
+    dst_file = os.path.join(dst_dir, fname)
+    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+    source_size = os.path.getsize(src_file)
+    if os.path.isfile(dst_file) and not os.path.islink(dst_file) and os.path.getsize(dst_file) == source_size:
         return
+    tmp_dst = dst_file + ".syncing"
     try:
-        dst_file = os.path.join(dst_dir, fname)
-        os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-        if os.path.exists(dst_file) and os.path.getsize(dst_file) == os.path.getsize(src_file):
-            return
-        tmp_dst = dst_file + ".syncing"
         with open(src_file, "rb") as rf, open(tmp_dst, "wb") as wf:
             shutil.copyfileobj(rf, wf, length=32 * 1024 * 1024)
+            wf.flush()
+            os.fsync(wf.fileno())
+        if os.path.getsize(tmp_dst) != source_size:
+            raise IOError(f"文件复制不完整: {fname}")
         os.replace(tmp_dst, dst_file)
-        print(f"[后台云盘同步完成] {fname} 已持久化保存至 Google Drive")
-    except Exception as e:
-        print(f"[后台云盘同步跳过] {fname}: {e}")
+    finally:
+        if os.path.exists(tmp_dst):
+            os.remove(tmp_dst)
+
+
+def _model_metadata_ready(model_id: str, model_dir: str) -> bool:
+    if model_id == "qwen38_27b_gguf":
+        return True
+    try:
+        with open(os.path.join(model_dir, ".easycolab-metadata.json"), encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        spec = MODEL_CATALOG[model_id]
+        files = manifest["files"]
+        if manifest["repo_id"] != spec["repo_id"] or manifest.get("subdir", "") != spec.get("metadata_subdir", ""):
+            return False
+        if not isinstance(files, dict) or not files:
+            return False
+        if _is_llm_model_id(model_id) and not {
+            "config.json", "tokenizer_config.json", "tokenizer.json", "model.safetensors.index.json"
+        }.issubset(files):
+            return False
+        for filename, size in files.items():
+            if os.path.isabs(filename) or os.path.normpath(filename) != filename or filename.startswith(".."):
+                return False
+            path = os.path.join(model_dir, filename)
+            if not isinstance(size, int) or size <= 0 or os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) != size:
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _ensure_model_metadata(model_id: str, model_dir: str) -> str:
+    spec = MODEL_CATALOG[model_id]
+    subdir = spec.get("metadata_subdir", "")
+    metadata_dir = os.path.join(model_dir, subdir)
+    if _model_metadata_ready(model_id, model_dir):
+        return metadata_dir
+    from huggingface_hub import snapshot_download
+
+    patterns = [f"{subdir}/*"] if subdir else ["*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken", "*.py"]
+    snapshot_download(repo_id=spec["repo_id"], local_dir=model_dir, allow_patterns=patterns)
+    local_patterns = [f"{subdir}/**/*"] if subdir else patterns
+    files = {}
+    for pattern in local_patterns:
+        for filename in glob.glob(pattern, root_dir=model_dir, recursive=True):
+            path = os.path.join(model_dir, filename)
+            if not os.path.isfile(path) or filename.startswith(".easycolab-"):
+                continue
+            if os.path.islink(path):
+                _copy_model_file(path, model_dir, filename)
+            files[filename] = os.path.getsize(path)
+    manifest_path = os.path.join(model_dir, ".easycolab-metadata.json")
+    with open(manifest_path + ".tmp", "w", encoding="utf-8") as stream:
+        json.dump({"repo_id": spec["repo_id"], "subdir": subdir, "files": files}, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(manifest_path + ".tmp", manifest_path)
+    if not _model_metadata_ready(model_id, model_dir):
+        raise RuntimeError(f"{spec['name']} 的配置或分词器文件不完整，请重新下载。")
+    return metadata_dir
 
 
 def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = "") -> Tuple[bool, str]:
@@ -2034,40 +2144,30 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             from huggingface_hub import login
             login(token=hf_token.strip(), add_to_git_credential=False)
 
-        ram_dir, nvme_dir, drive_dir = _get_model_dirs(target_id)
-        drive_has_space = False
-        if DRIVE_MOUNTED and os.path.exists("/content/drive/MyDrive"):
-            try:
-                drive_free_gb = shutil.disk_usage("/content/drive/MyDrive").free / (1024 ** 3)
-                drive_has_space = drive_free_gb >= spec["approx_size_gb"] + 2.0
-                if not drive_has_space:
-                    print(
-                        f"ℹ️ Google Drive 剩余空间 ({drive_free_gb:.1f} GB) 小于 {spec['name']} 所需容量 "
-                        f"({spec['approx_size_gb']:.1f} GB)，自动改用实例本地高速 NVMe 磁盘 ({nvme_dir}) 存储！"
-                    )
-            except Exception:
-                drive_has_space = False
-
-        primary_dl_dir = ram_dir if ram_dir else (drive_dir if (DRIVE_MOUNTED and drive_has_space) else nvme_dir)
+        nvme_dir, drive_dir = _get_model_dirs(target_id)[1:]
+        if DRIVE_MOUNTED and not _google_drive_is_mounted():
+            raise RuntimeError("Google Drive 挂载已断开，请重新挂载并重启服务端，不会回退到临时磁盘。")
+        primary_dl_dir = drive_dir if DRIVE_MOUNTED else nvme_dir
+        if not DRIVE_MOUNTED:
+            print("⚠️ Google Drive 未挂载：模型仅保存在实例临时磁盘，释放实例后会丢失。")
         os.makedirs(primary_dl_dir, exist_ok=True)
         total_files = len(req_files)
 
         for idx, (fname, desc) in enumerate(req_files):
             touch_activity()
-            existing = _find_existing_model_file(target_id, fname)
+            target_file = os.path.join(primary_dl_dir, fname)
+            existing = (
+                target_file if os.path.isfile(target_file) and not os.path.islink(target_file)
+                and os.path.getsize(target_file) > 64 * 1024
+                else _find_existing_model_file(target_id, fname)
+            )
             base_prog = idx / float(total_files + 1)
             MODEL_DOWNLOAD_STATE["progress"] = round(base_prog + 0.04, 2)
 
             if existing:
-                # 若使用 Qwen3.8-27B，确保同一目录内有软链接以便 AutoModel 直接按目录加载
-                if target_id == "qwen38_27b":
-                    target_link = os.path.join(primary_dl_dir, fname)
-                    os.makedirs(os.path.dirname(target_link), exist_ok=True)
-                    if os.path.abspath(existing) != os.path.abspath(target_link) and not os.path.exists(target_link):
-                        try:
-                            os.symlink(existing, target_link)
-                        except Exception:
-                            pass
+                MODEL_DOWNLOAD_STATE["message"] = f"[{idx+1}/{total_files}] 正在确认或复制已有权重 {fname} 至 {primary_dl_dir}..."
+                print(MODEL_DOWNLOAD_STATE["message"])
+                _copy_model_file(existing, primary_dl_dir, fname)
                 size_gb = os.path.getsize(existing) / (1024 ** 3)
                 MODEL_DOWNLOAD_STATE["message"] = f"[{idx+1}/{total_files}] {fname} 已就绪 ({size_gb:.2f} GB)，跳过下载"
                 print(MODEL_DOWNLOAD_STATE["message"])
@@ -2075,62 +2175,33 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
 
             MODEL_DOWNLOAD_STATE["message"] = f"[{idx+1}/{total_files}] 正在 8 线程并发下载 {fname} ({desc})..."
             print(MODEL_DOWNLOAD_STATE["message"])
-            dl_path = fast_parallel_hf_download(
+            fast_parallel_hf_download(
                 repo_id=repo_id,
                 filename=fname,
                 dest_dir=primary_dl_dir,
                 hf_token=hf_token,
                 num_connections=8,
             )
-            if DRIVE_MOUNTED and drive_has_space and primary_dl_dir != drive_dir:
-                threading.Thread(
-                    target=_async_backup_to_drive,
-                    args=(dl_path, drive_dir, fname),
-                    daemon=True,
-                ).start()
 
         MODEL_DOWNLOAD_STATE["progress"] = 0.92
         if target_id == "qwen38_27b_gguf":
             MODEL_DOWNLOAD_STATE["message"] = "正在预装并校验 llama.cpp CUDA 高速推理引擎..."
             _ensure_llama_server_binary()
         else:
-            MODEL_DOWNLOAD_STATE["message"] = f"正在获取 {spec['name']} 的分词器与 Processor 配置文件..."
-            from huggingface_hub import snapshot_download
+            MODEL_DOWNLOAD_STATE["message"] = f"正在保存并校验 {spec['name']} 的分词器与 Processor 配置文件..."
+            _ensure_model_metadata(target_id, primary_dl_dir)
 
-            if target_id == "minimax_h3":
-                from diffsynth.pipelines.minimax_h3_audio_video import ModelConfig
-                proc_cfg = ModelConfig(
-                    model_id="MiniMaxAI/MiniMax-H3",
-                    origin_file_pattern="FL2VA/processor/",
-                    download_source="huggingface",
-                )
-                proc_cfg.download_if_necessary()
-            elif target_id == "qwen38_27b":
-                snapshot_download(
-                    repo_id="Qwen/Qwen3.8-27B",
-                    local_dir=primary_dl_dir,
-                    ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
-                )
-            elif target_id == "qwen_image_21":
-                from diffsynth.pipelines.qwen_image_21 import ModelConfig
-                proc_cfg = ModelConfig(
-                    model_id="Qwen/Qwen-Image-2.1",
-                    origin_file_pattern="processor/",
-                    download_source="huggingface",
-                )
-                proc_cfg.download_if_necessary()
-            elif target_id == "z_image_turbo":
-                from diffsynth.pipelines.z_image import ModelConfig
-                tok_cfg = ModelConfig(
-                    model_id="Tongyi-MAI/Z-Image-Turbo",
-                    origin_file_pattern="tokenizer/",
-                    download_source="huggingface",
-                )
-                tok_cfg.download_if_necessary()
-
-        MODEL_DOWNLOAD_STATE["progress"] = 1.0
+        if DRIVE_MOUNTED and not _google_drive_is_mounted():
+            raise RuntimeError("Google Drive 挂载已断开，无法确认模型持久化完成。")
+        if not _model_directory_ready(target_id, primary_dl_dir):
+            raise RuntimeError("模型权重或配置未完整保存，请检查存储空间后重试。")
         status = check_model_files_status(target_id)
-        msg = f"{spec['name']} 全部 {status['downloaded_count']}/{status['total_count']} 个权重文件已就绪（共 {status['total_size_gb']:.2f} GB），现在可点击「加载到显存」！"
+        storage_message = (
+            f"权重与配置已完整持久化至 Google Drive: {primary_dl_dir}，下次挂载后可直接复用。"
+            if DRIVE_MOUNTED else f"仅保存至实例临时磁盘: {primary_dl_dir}，释放实例后会丢失。"
+        )
+        msg = f"{spec['name']} 全部 {status['downloaded_count']}/{status['total_count']} 个权重文件已就绪（共 {status['total_size_gb']:.2f} GB）。{storage_message}现在可点击「加载到显存」！"
+        MODEL_DOWNLOAD_STATE["progress"] = 1.0
         MODEL_DOWNLOAD_STATE["message"] = msg
         print(msg)
         return True, msg
@@ -2643,7 +2714,9 @@ def _sync_legacy_globals():
     if _is_llm_model_id(SELECTED_MODEL_ID) and SELECTED_MODEL_ID in LOADED_RUNTIMES:
         LLM_BUNDLE = LOADED_RUNTIMES[SELECTED_MODEL_ID].get("llm_bundle")
     if LLM_BUNDLE is None:
-        for llm_id in ("qwen38_27b_gguf", "qwen38_27b"):
+        for llm_id in ("qwen38_27b_gguf", *MODEL_CATALOG):
+            if not _is_llm_model_id(llm_id):
+                continue
             rt = LOADED_RUNTIMES.get(llm_id)
             if rt and rt.get("llm_bundle") is not None:
                 LLM_BUNDLE = rt["llm_bundle"]
@@ -2803,6 +2876,9 @@ def load_model_to_vram_core(
     file_status = check_model_files_status(target_id)
     auto_switched_notice = ""
 
+    if DRIVE_MOUNTED and not _google_drive_is_mounted():
+        return False, "Google Drive 挂载已断开，请重新挂载并重启服务端。"
+
     if target_id == "qwen38_27b_gguf":
         if not (
             _find_existing_model_file("qwen38_27b_gguf", "Qwen3.8-27B-UD-Q4_K_M.gguf")
@@ -2828,6 +2904,8 @@ def load_model_to_vram_core(
             # 计算新模型所需最小空闲显存阈值：余量充足时自动与已加载模型共驻显存！
             if target_id == "qwen38_27b":
                 required_free_gb = 53.0
+            elif target_id == "deepseek_v4_pro_qwen35_9b_heretic":
+                required_free_gb = 20.5
             elif target_id == "qwen38_27b_gguf":
                 q4_kv_gb = (ctx_len / 262144.0) * 4.6
                 required_free_gb = min(max(20.8, 20.6 + q4_kv_gb), max(12.0, total_vram_gb - 1.2))
@@ -2950,9 +3028,7 @@ def load_model_to_vram_core(
                         ModelConfig(path=avae_path, **vae_cfg),
                     ],
                     processor_config=ModelConfig(
-                        model_id="MiniMaxAI/MiniMax-H3",
-                        origin_file_pattern="FL2VA/processor/",
-                        download_source="huggingface",
+                        path=_ensure_model_metadata(target_id, _get_model_dirs(target_id)[2]),
                     ),
                     vram_limit=vram_limit,
                 )
@@ -2989,9 +3065,7 @@ def load_model_to_vram_core(
                         ModelConfig(path=vae_path, **vram_config),
                     ],
                     processor_config=ModelConfig(
-                        model_id="Qwen/Qwen-Image-2.1",
-                        origin_file_pattern="processor/",
-                        download_source="huggingface",
+                        path=_ensure_model_metadata(target_id, _get_model_dirs(target_id)[2]),
                     ),
                     vram_limit=vram_limit,
                 )
@@ -3020,52 +3094,48 @@ def load_model_to_vram_core(
                         ModelConfig(path=vae_path, **vram_config),
                     ],
                     tokenizer_config=ModelConfig(
-                        model_id="Tongyi-MAI/Z-Image-Turbo",
-                        origin_file_pattern="tokenizer/",
-                        download_source="huggingface",
+                        path=_ensure_model_metadata(target_id, _get_model_dirs(target_id)[2]),
                     ),
                     vram_limit=vram_limit,
                 )
                 _enable_high_vram_optimizations(new_pipe, total_vram_gb=total_vram_gb, preload_vram=True)
                 mode_label = "Z-Image-Turbo · 8步极速 BF16"
 
-            elif target_id == "qwen38_27b":
-                if free_before_gb < 49.0:
+            elif _is_llm_model_id(target_id) and target_id != "qwen38_27b_gguf":
+                minimum_free_gb = 49.0 if target_id == "qwen38_27b" else 20.0
+                if free_before_gb < minimum_free_gb:
                     raise RuntimeError(
                         f"当前 GPU 可用显存 ({free_before_gb:.1f} GB / 总计 {total_vram_gb:.1f} GB) 不足以加载 "
-                        f"Qwen3.8-27B BF16 原生权重（需约 52 GB 显存，推荐 A100 80GB）。"
-                        f"若在 L4 (24GB) 或中低显存运行，请在模型中心选择独立的「Qwen3.8-27B-GGUF (UD-Q4_K_M)」量化版！"
+                        f"{spec['name']} BF16 原生权重（至少需约 {minimum_free_gb:.0f} GB 可用显存）。"
+                        "请卸载其他模型或切换至更大显存的 GPU 实例。"
                     )
 
                 MODEL_DOWNLOAD_STATE["progress"] = 0.30
                 MODEL_DOWNLOAD_STATE["message"] = (
-                    f"正在装载 Qwen3.8-27B BF16 原生满血权重 (上下文上限 {ctx_len // 1024}K)..."
+                    f"正在装载 {spec['name']} BF16 原生满血权重 (上下文上限 {ctx_len // 1024}K)..."
                 )
-                first_shard = _find_existing_model_file("qwen38_27b", "model-00001-of-00018.safetensors")
-                model_dir = os.path.dirname(first_shard) if first_shard else _get_model_dirs("qwen38_27b")[2]
-
-                # 确保配置文件在同一目录中完备
-                if not os.path.exists(os.path.join(model_dir, "config.json")):
-                    from huggingface_hub import snapshot_download
-                    snapshot_download(
-                        repo_id="Qwen/Qwen3.8-27B",
-                        local_dir=model_dir,
-                        ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
-                    )
+                model_dir = _get_model_dirs(target_id)[2]
+                for filename, description in spec["files"]:
+                    existing = _find_existing_model_file(target_id, filename)
+                    if not existing:
+                        raise FileNotFoundError(f"模型权重缺失: {filename}")
+                    _copy_model_file(existing, model_dir, filename)
+                _ensure_model_metadata(target_id, model_dir)
 
                 def _load_qwen_vl_bf16():
                     _ensure_torchaudio_compatible()
                     _ensure_qwen_fast_kernels()
                     from transformers import AutoProcessor, AutoModelForImageTextToText
-                    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+                    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True, local_files_only=True)
                     mdl = AutoModelForImageTextToText.from_pretrained(
                         model_dir,
                         dtype=torch.bfloat16,
                         attn_implementation="sdpa",
                         device_map="cuda",
                         trust_remote_code=True,
+                        local_files_only=True,
                     )
-                    mode_tag = f"Qwen3.8-27B · BF16 原生 · {ctx_len // 1024}K"
+                    mode_tag = f"{spec['name']} · BF16 原生 · {ctx_len // 1024}K"
                     print("[加速引擎] 已启用 FLA Triton 线性注意力 + Triton 融合 CausalConv1d + PyTorch SDPA！")
                     mdl.eval()
                     _optimize_qwen35_for_fast_inference(mdl, max_context_len=ctx_len)
@@ -3087,7 +3157,7 @@ def load_model_to_vram_core(
                     "backend": "transformers",
                     "model": mdl,
                     "processor": proc,
-                    "model_id": "qwen38_27b",
+                    "model_id": target_id,
                     "context_length": ctx_len,
                 }
                 mode_label = mode_tag
@@ -3101,26 +3171,23 @@ def load_model_to_vram_core(
                 mtp_rel = "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
                 mtp_path: Optional[str] = None
                 try:
-                    if not _find_existing_model_file("qwen38_27b_gguf", mtp_rel):
+                    existing_mtp = _find_existing_model_file("qwen38_27b_gguf", mtp_rel)
+                    nvme_d, drive_d = _get_model_dirs("qwen38_27b_gguf")[1:]
+                    dl_dir = drive_d if DRIVE_MOUNTED else nvme_d
+                    if existing_mtp:
+                        _copy_model_file(existing_mtp, dl_dir, mtp_rel)
+                    else:
                         MODEL_DOWNLOAD_STATE["progress"] = 0.38
                         MODEL_DOWNLOAD_STATE["message"] = "正在自动补齐 Unsloth MTP 投机解码加速头 (1.31 GB)..."
                         print("[GGUF 引擎] 检测到尚未缓存 MTP 投机解码权重，正在 8 路并发极速补齐...")
-                        ram_d, nvme_d, drive_d = _get_model_dirs("qwen38_27b_gguf")
-                        dl_dir = ram_d if ram_d else (drive_d if DRIVE_MOUNTED else nvme_d)
                         os.makedirs(dl_dir, exist_ok=True)
-                        dl_mtp = fast_parallel_hf_download(
+                        fast_parallel_hf_download(
                             repo_id="unsloth/Qwen3.8-27B-GGUF",
                             filename=mtp_rel,
                             dest_dir=dl_dir,
                             hf_token=os.environ.get("HF_TOKEN", ""),
                             num_connections=8,
                         )
-                        if DRIVE_MOUNTED and dl_dir != drive_d:
-                            threading.Thread(
-                                target=_async_backup_to_drive,
-                                args=(dl_mtp, drive_d, mtp_rel),
-                                daemon=True,
-                            ).start()
                     mtp_path = _resolve_and_stage_model_file("qwen38_27b_gguf", mtp_rel)
                 except Exception as mtp_e:
                     print(f"[GGUF 引擎] MTP 投机权重获取跳过，将以标准模式启动: {mtp_e}")
@@ -5547,18 +5614,22 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
     candidates: List[str] = []
     if preferred_model_id:
         low = preferred_model_id.lower()
-        if preferred_model_id in ("qwen38_27b", "qwen38_27b_gguf"):
+        if _is_llm_model_id(preferred_model_id):
             candidates.append(preferred_model_id)
         elif "gguf" in low or "q4_k" in low or "unsloth" in low:
             candidates.append("qwen38_27b_gguf")
         elif "qwen3.8" in low or "qwen38" in low:
             candidates.extend(["qwen38_27b_gguf", "qwen38_27b"])
+        else:
+            for model_id, spec in MODEL_CATALOG.items():
+                if _is_llm_model_id(model_id) and low in (model_id.lower(), spec["repo_id"].lower(), spec["name"].lower()):
+                    candidates.append(model_id)
 
     if _is_llm_model_id(SELECTED_MODEL_ID) and SELECTED_MODEL_ID not in candidates:
         candidates.append(SELECTED_MODEL_ID)
 
-    for fallback_id in ("qwen38_27b_gguf", "qwen38_27b"):
-        if fallback_id not in candidates:
+    for fallback_id in ("qwen38_27b_gguf", *MODEL_CATALOG):
+        if _is_llm_model_id(fallback_id) and fallback_id not in candidates:
             candidates.append(fallback_id)
 
     for cid in candidates:
@@ -7024,11 +7095,12 @@ def attach_macos_api_routes(app: FastAPI):
         global QWEN_CONTEXT_LENGTH
         QWEN_CONTEXT_LENGTH = _clamp_context_length(req.context_length)
         # BF16 Transformers 运行时支持直接热更新动态上下文上限；GGUF 需重载以重分配 KV 槽位
-        bf16_rt = LOADED_RUNTIMES.get("qwen38_27b")
-        if bf16_rt and bf16_rt.get("llm_bundle"):
-            bf16_rt["llm_bundle"]["context_length"] = QWEN_CONTEXT_LENGTH
-            bf16_rt["mode_label"] = f"Qwen3.8-27B · BF16 原生 · {QWEN_CONTEXT_LENGTH // 1024}K"
-            _sync_legacy_globals()
+        for model_id, runtime in LOADED_RUNTIMES.items():
+            bundle = runtime.get("llm_bundle")
+            if bundle and bundle.get("backend") == "transformers":
+                bundle["context_length"] = QWEN_CONTEXT_LENGTH
+                runtime["mode_label"] = f"{MODEL_CATALOG[model_id]['name']} · BF16 原生 · {QWEN_CONTEXT_LENGTH // 1024}K"
+        _sync_legacy_globals()
         touch_activity()
         print(f"[上下文配置] 目标最大上下文长度已设为 {QWEN_CONTEXT_LENGTH // 1024}K ({QWEN_CONTEXT_LENGTH} tokens)")
         return get_gpu_status_dict(model_id=SELECTED_MODEL_ID)
@@ -7062,6 +7134,13 @@ def attach_macos_api_routes(app: FastAPI):
             {"id": "Tongyi-MAI/Z-Image-Turbo", "object": "model", "created": now_ts, "owned_by": "tongyi", "loaded": "z_image_turbo" in LOADED_RUNTIMES},
             {"id": "MiniMaxAI/MiniMax-H3", "object": "model", "created": now_ts, "owned_by": "minimax", "loaded": "minimax_h3" in LOADED_RUNTIMES},
         ]
+        listed_ids = {model["id"] for model in models_data}
+        for model_id, spec in MODEL_CATALOG.items():
+            if _is_llm_model_id(model_id) and spec["repo_id"] not in listed_ids:
+                models_data.append({
+                    "id": spec["repo_id"], "object": "model", "created": now_ts,
+                    "owned_by": spec["repo_id"].split("/")[0], "loaded": model_id in LOADED_RUNTIMES,
+                })
         return {"object": "list", "data": models_data}
 
     @app.post("/v1/chat/completions")

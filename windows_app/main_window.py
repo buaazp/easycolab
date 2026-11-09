@@ -2832,14 +2832,14 @@ class EasyColabMainWindow(QMainWindow):
         oai_base_shown = f"{shown_host}/v1"
         key = self.vm.api_access_key if self.vm.api_key_enabled else "sk-no-key-required"
 
-        if self.vm.selected_model_id == "qwen38_27b_gguf":
-            repo = "unsloth/Qwen3.8-27B-GGUF"
-        elif self.vm.selected_model_id == "qwen38_27b":
-            repo = "Qwen/Qwen3.8-27B"
-        elif "qwen38_27b_gguf" in self.vm.loaded_model_ids and "qwen38_27b" not in self.vm.loaded_model_ids:
-            repo = "unsloth/Qwen3.8-27B-GGUF"
+        if self.vm.active_model_spec.modality == ModelModality.LLM_VLM:
+            repo = self.vm.active_model_spec.repo_id
         else:
-            repo = "Qwen/Qwen3.8-27B"
+            repo = next(
+                (spec.repo_id for spec in OPEN_MODEL_CATALOG
+                 if spec.modality == ModelModality.LLM_VLM and spec.id in self.vm.loaded_model_ids),
+                "Qwen/Qwen3.8-27B",
+            )
 
         py_msg = tr("帮我设计一个高并发网关架构", "Design a high-concurrency API gateway architecture")
         oai_curl_msg = tr("用三句话解释量子纠缠", "Explain quantum entanglement in three sentences")
@@ -2924,7 +2924,7 @@ class EasyColabMainWindow(QMainWindow):
         if not self.api_key_input.hasFocus():
             self.api_key_input.setText(self.vm.api_access_key)
 
-        disp_name = "Qwen3.8-27B-GGUF" if "GGUF" in sn["repo"] else "Qwen3.8-27B"
+        disp_name = sn["repo"].split("/")[-1]
         if not self.vm.is_qwen_loaded_in_vram:
             self.api_coresident_hint.setText(
                 tr(

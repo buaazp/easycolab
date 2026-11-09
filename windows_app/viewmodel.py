@@ -464,7 +464,10 @@ class EasyColabViewModel(QObject):
 
     @property
     def is_qwen_loaded_in_vram(self) -> bool:
-        return ("qwen38_27b_gguf" in self.loaded_model_ids) or ("qwen38_27b" in self.loaded_model_ids)
+        return any(
+            spec.modality == ModelModality.LLM_VLM and spec.id in self.loaded_model_ids
+            for spec in OPEN_MODEL_CATALOG
+        )
 
     @property
     def display_account_label(self) -> str:
@@ -1278,8 +1281,6 @@ class EasyColabViewModel(QObject):
             self.comfy_queue_pending = int(comfy.get("queue_pending") or 0)
             if comfy.get("persistence_label"):
                 self.comfy_persistence_label = localize_server_text(strip_emoji(str(comfy["persistence_label"])))
-            if comfy.get("drive_persisted") is not None:
-                self.drive_persisted = self.drive_persisted or bool(comfy["drive_persisted"])
             self.comfy_custom_nodes_count = int(comfy.get("custom_nodes_count") or 0)
             self.comfy_models_count = int(comfy.get("models_count") or 0)
             self.comfy_workflows_count = int(comfy.get("workflows_count") or 0)

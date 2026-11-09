@@ -28,6 +28,7 @@
   3. **`Qwen3.8-27B (UD-Q4_K_M + MTP 投机解码 / BF16)` · 100 tok/s 视觉对话与双协议网关**
      - 支持最高 `256K` 上下文、长思维链推理、多模态看图反推提示词。
      - 内置兼容 **OpenAI (`/v1/chat/completions`)** 与 **Anthropic (`/v1/messages`)** 的公网 API 网关（支持 Bearer / `x-api-key` 鉴权），可直接接入 **Claude Code**、**Cursor** 等开发工具。
+     - 可选 [**DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic**](https://huggingface.co/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic)：基于 Qwen3.5-9B 的蒸馏推理模型，复用 BF16 对话、视觉与双协议网关流程。下载约 `18 GiB`（4 个主分片 + 索引必需的 MTP 权重，不启用 MTP 投机解码），加载前至少预留约 `20 GiB` 可用显存，长上下文另需额外显存；API 的 `model` 使用完整仓库 ID。
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K 海报生图与多图指令修图**
      - 支持高质感中英文排版直出、双图自然语言指令修图与 8 步极速出图；所有生成的 MP4 / PNG 自动回传至本地目录（macOS: `~/Movies/EasyColab`，Windows: `%USERPROFILE%\Videos\EasyColab`）。
 
@@ -110,6 +111,23 @@ python windows_app/easycolab_win.py
 1. 打开 [Google Colab](https://colab.research.google.com/)，上传本仓库根目录下的 `EasyColab_Server.ipynb`（或在客户端引导页点击「导出 / 定位 `.ipynb` 笔记本」）。
 2. 在 Colab 菜单栏选择 `代码执行程序 -> 更改运行时类型`，选择 `G4` / `A100` / `L4` GPU 并按顺序运行单元格。
 3. 将输出的 `https://xxxx.gradio.live` 链接粘贴至桌面客户端左侧服务地址栏点击「连接」即可。
+
+---
+
+## 模型权重持久化与自定义目录
+
+在笔记本第二步保持 `MOUNT_GOOGLE_DRIVE = True`，按需修改 `EASYCOLAB_MODEL_DIR`，然后完成 Drive 挂载授权并启动服务端。默认模型目录为：
+
+```text
+/content/drive/MyDrive/models/<Hugging Face 用户或组织>/<模型仓库>/
+```
+
+- 例如可将 `EASYCOLAB_MODEL_DIR` 改为 `/content/drive/MyDrive/AI/models`。目录必须位于挂载的 `MyDrive` 下；修改后需重启服务端。独立启动 `app.py` 时也可设置同名环境变量，优先级高于兼容的 `DIFFSYNTH_MODEL_BASE_PATH`。
+- 首次点击「下载权重」会直接写入 Drive，同时保存分词器、Processor、配置和聊天模板等必需文件；仅在文件写入和配置清单校验通过后才显示「完整持久化」。云盘空间不足、写入失败或挂载断开会报错，不会静默改存临时盘。
+- 下次启动只需重新挂载同一个 Drive，即可复用权重和配置。再次点击「下载权重」也会跳过已有文件；已完成的配置通过 `.easycolab-metadata.json` 清单校验，缺失时自动补齐。运行环境依赖安装仍可能联网。
+- 兼容读取旧的 `EasyColab_Models`、`Aevix_Models`、`MiniMax_H3_Models` 和默认 `models` 目录。点击「下载权重」会把旧目录或本地缓存中的文件复制到新目录，不重新下载已有大权重，也不删除旧文件；迁移期间需预留副本空间。
+- Drive 是持久化主存储，不是 GPU 显存。每个新实例仍需读取权重到内存/显存，原有加载阶段的 RAM/NVMe 预热机制继续保留。首次下载速度受 Drive 写入速度限制。
+- 主动关闭挂载且实例没有其他 Drive 挂载时，文件仅保存在实例临时磁盘，界面会明确提示；释放实例后这些文件会丢失。仅配置 rclone 或启动 ComfyUI 不会将普通模型错误标记为「已持久化」。
 
 ---
 

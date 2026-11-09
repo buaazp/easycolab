@@ -726,6 +726,60 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
         ],
     ),
     OpenModelSpec(
+        id="deepseek_v4_pro_qwen35_9b_heretic",
+        name_zh="DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        name_en="DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        repo_id="xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        badge_zh="BF16 原生 · 18 GB",
+        badge_en="Native BF16 · 18 GB",
+        summary_zh="基于 Qwen3.5-9B 的 DeepSeek-V4-Pro 蒸馏推理模型（Heretic 版本），支持最高 256K 上下文",
+        summary_en="DeepSeek-V4-Pro reasoning distillation based on Qwen3.5-9B (Heretic variant), up to 256K context",
+        approx_size_gb=18.0,
+        icon="brain",
+        modality=ModelModality.LLM_VLM,
+        default_steps=20,
+        modes=[
+            TaskModeItem(
+                id="chat",
+                title_zh="深度推理对话",
+                title_en="Deep Reasoning Chat",
+                subtitle_zh="支持数学、科学与多轮推理对话",
+                subtitle_en="Mathematics, science & multi-turn reasoning chat",
+                icon="bubble.left.and.bubble.right",
+            ),
+            TaskModeItem(
+                id="vlm",
+                title_zh="图像视觉理解",
+                title_en="Vision Understanding",
+                subtitle_zh="使用 Qwen3.5 视觉编码器进行图片理解",
+                subtitle_en="Image understanding with the Qwen3.5 vision encoder",
+                icon="eye",
+            ),
+            TaskModeItem(
+                id="api",
+                title_zh="API 协议网关",
+                title_en="API Protocol Gateway",
+                subtitle_zh="提供 OpenAI (/v1) 与 Anthropic (/v1/messages) 双协议公网接口",
+                subtitle_en="Dual-protocol public gateway supporting OpenAI (/v1) & Anthropic (/v1/messages)",
+                icon="network",
+            ),
+        ],
+        default_files=[
+            ModelFileItem(
+                name=f"model-{shard:05d}-of-00004.safetensors",
+                desc=f"权重分片 {shard}/4",
+                desc_en=f"Weight Shard {shard}/4",
+            )
+            for shard in range(1, 5)
+        ] + [
+            ModelFileItem(
+                name="model-mtp.safetensors",
+                desc="MTP 权重（模型索引必需文件）",
+                desc_en="MTP Weights (required by model index)",
+            ),
+        ],
+    ),
+    OpenModelSpec(
         id="qwen_image_21",
         name_zh="Qwen-Image-2.1",
         name_en="Qwen-Image-2.1",

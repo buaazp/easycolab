@@ -28,6 +28,7 @@ Optimized out of the box for **Google Colab G4 (`NVIDIA RTX PRO 6000 Blackwell` 
   3. **`Qwen3.8-27B (UD-Q4_K_M + MTP Speculative Decoding / BF16)` · 100 tok/s Vision Chat & Dual-Protocol API Gateway**
      - Supports up to `256K` context length, deep chain-of-thought reasoning, and multimodal image analysis / prompt reverse-engineering.
      - Built-in public API gateway compatible with both **OpenAI (`/v1/chat/completions`)** and **Anthropic (`/v1/messages`)** (with Bearer / `x-api-key` authentication), ready to plug directly into **Claude Code**, **Cursor**, and custom agent workflows.
+     - Optional [**DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic**](https://huggingface.co/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic): a Qwen3.5-9B reasoning distillation using the BF16 chat, vision, and dual-protocol gateway path. Downloads approximately `18 GiB` (4 main shards plus index-required MTP weights; MTP speculative decoding is not enabled). Allow at least approximately `20 GiB` of free VRAM to load; long contexts need additional VRAM. Use the full repository ID as the API `model`.
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K Poster Generation & Multi-Image Instruction Editing**
      - High-fidelity bilingual typography rendering, natural-language multi-image editing, and 8-step ultra-fast photorealistic generation. All generated MP4 videos and PNG images are automatically pulled back to your local machine (macOS: `~/Movies/EasyColab`, Windows: `%USERPROFILE%\Videos\EasyColab`).
 
@@ -103,6 +104,23 @@ python windows_app/easycolab_win.py
 1. Open [Google Colab](https://colab.research.google.com/) and upload `EasyColab_Server.ipynb` from the repository root (or click **Export / Locate `.ipynb` Notebook** inside the app's Onboarding Guide).
 2. In the Colab menu bar, select `Runtime -> Change runtime type`, choose `G4` / `A100` / `L4` GPU, and run the cells in order.
 3. Copy the printed `https://xxxx.gradio.live` URL into the **Server URL** field on the left sidebar of the desktop client and click **Connect**.
+
+---
+
+## Persistent Model Storage & Custom Directories
+
+Keep `MOUNT_GOOGLE_DRIVE = True` in the notebook's second cell, optionally edit `EASYCOLAB_MODEL_DIR`, authorize the Drive mount, and then start the server. The default model location is:
+
+```text
+/content/drive/MyDrive/models/<Hugging Face owner>/<model repository>/
+```
+
+- Set `EASYCOLAB_MODEL_DIR` to a directory such as `/content/drive/MyDrive/AI/models`. It must be a subdirectory of the mounted `MyDrive`; restart the server after changing it. Standalone `app.py` also accepts this environment variable, with precedence over the compatible `DIFFSYNTH_MODEL_BASE_PATH` setting.
+- "Download Weights" writes directly to Drive and saves the required tokenizer, processor, configuration, and chat-template files. Completion is reported only after writes and configuration-manifest checks succeed. Full storage, write failures, and disconnected mounts produce errors instead of silently falling back to temporary storage.
+- Mount the same Drive on subsequent starts to reuse weights and configuration. Repeating "Download Weights" skips existing files. Completed configuration is checked using `.easycolab-metadata.json`, with missing files fetched again. Installing runtime dependencies may still require network access.
+- Existing `EasyColab_Models`, `Aevix_Models`, `MiniMax_H3_Models`, and default `models` directories remain readable. "Download Weights" copies existing weights from legacy directories or local caches into the configured directory without downloading them again or deleting the originals; allow space for the copies during migration.
+- Drive is persistent storage, not GPU VRAM. Each fresh instance still reads weights into RAM/VRAM; existing load-time RAM/NVMe staging remains available. Initial download speed is limited by Drive write throughput.
+- Disabling mounting on an instance with no other Drive mount explicitly uses temporary storage, which is lost when the instance is released. Merely configuring rclone or starting ComfyUI no longer marks ordinary models as persisted.
 
 ---
 
