@@ -807,6 +807,28 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
         ] + [ModelFileItem(name="model-mtp.safetensors", desc="MTP 权重（不默认启用投机解码）", desc_en="MTP weights (speculation off by default)")],
     ),
     OpenModelSpec(
+        id="qwen38_flash_next_modelopt_sglang",
+        name_zh="OrcaRouter Flash-Next ModelOpt · Penny Royal",
+        name_en="OrcaRouter Flash-Next ModelOpt · Penny Royal",
+        repo_id="jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4",
+        badge_zh="实验 SGLang · MTP · 126 GiB",
+        badge_en="Experimental SGLang · MTP · 126 GiB",
+        summary_zh="独立 ModelOpt 权重；SM120 96GB、FP8 PLE→CPU；独立 Penny Royal 环境，不替换原 vLLM 模型",
+        summary_en="Separate ModelOpt weights; SM120 96GB, FP8 PLE on CPU; isolated Penny Royal, existing vLLM unchanged",
+        approx_size_gb=125.91,
+        icon="bolt.circle",
+        modality=ModelModality.LLM_VLM,
+        default_steps=20,
+        modes=[
+            TaskModeItem(id="chat", title_zh="MTP 推理对话", title_en="MTP Chat", subtitle_zh="NEXTN 原生投机解码 · 实验后端", subtitle_en="Native NEXTN speculation · experimental backend", icon="bubble.left.and.bubble.right"),
+            TaskModeItem(id="vlm", title_zh="图像理解", title_en="Vision", subtitle_zh="ModelOpt 保留视觉塔", subtitle_en="ModelOpt vision tower retained", icon="eye"),
+            TaskModeItem(id="api", title_zh="API 协议网关", title_en="API Gateway", subtitle_zh="OpenAI / Anthropic 接口与工具调用", subtitle_en="OpenAI / Anthropic APIs and tools", icon="network"),
+        ],
+        default_files=[ModelFileItem(name=f"layer-{layer:05d}-experts-{start:04d}-{start+127:04d}.safetensors", desc="ModelOpt NVFP4 专家分片", desc_en="ModelOpt NVFP4 expert shard") for layer in range(48) for start in (0,128,256,384)]
+        + [ModelFileItem(name=f"model-bf16-{part:05d}.safetensors", desc="BF16 / MTP / 视觉分片", desc_en="BF16 / MTP / vision shard") for part in (1,10,11,12)]
+        + [ModelFileItem(name=f"model-plefp8-{part:05d}.safetensors", desc="FP8 PLE 查表分片", desc_en="FP8 PLE table shard") for part in range(10)],
+    ),
+    OpenModelSpec(
         id="qwen_image_21",
         name_zh="Qwen-Image-2.1",
         name_en="Qwen-Image-2.1",

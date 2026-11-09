@@ -509,6 +509,34 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         } + [ModelFileItem(name: "model-mtp.safetensors", desc: "MTP 权重（不默认启用投机解码）", exists: false, size_gb: 0)]
     ),
     OpenModelSpec(
+        id: "qwen38_flash_next_modelopt_sglang",
+        nameZh: "OrcaRouter Flash-Next ModelOpt · Penny Royal",
+        nameEn: "OrcaRouter Flash-Next ModelOpt · Penny Royal",
+        repoId: "jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4",
+        badgeZh: "实验 SGLang · MTP · 126 GiB",
+        badgeEn: "Experimental SGLang · MTP · 126 GiB",
+        summaryZh: "独立 ModelOpt 权重；SM120 96GB、FP8 PLE→CPU；独立 Penny Royal 环境，不替换原 vLLM 模型",
+        summaryEn: "Separate ModelOpt weights; SM120 96GB, FP8 PLE on CPU; isolated Penny Royal, existing vLLM unchanged",
+        approxSizeGB: 125.91,
+        icon: "bolt.circle",
+        modality: .llmVLM,
+        defaultSteps: 20,
+        modes: [
+            TaskModeItem(id: "chat", titleZh: "MTP 推理对话", titleEn: "MTP Chat", subtitleZh: "NEXTN 原生投机解码 · 实验后端", subtitleEn: "Native NEXTN speculation · experimental backend", icon: "bubble.left.and.bubble.right"),
+            TaskModeItem(id: "vlm", titleZh: "图像理解", titleEn: "Vision", subtitleZh: "ModelOpt 保留视觉塔", subtitleEn: "ModelOpt vision tower retained", icon: "eye"),
+            TaskModeItem(id: "api", titleZh: "API 协议网关", titleEn: "API Gateway", subtitleZh: "OpenAI / Anthropic 接口与工具调用", subtitleEn: "OpenAI / Anthropic APIs and tools", icon: "network")
+        ],
+        defaultFiles: (0..<48).flatMap { layer in
+            [0, 128, 256, 384].map { start in
+                ModelFileItem(name: String(format: "layer-%05d-experts-%04d-%04d.safetensors", layer, start, start + 127), desc: "ModelOpt NVFP4 专家分片", exists: false, size_gb: 0)
+            }
+        } + [1, 10, 11, 12].map { part in
+            ModelFileItem(name: String(format: "model-bf16-%05d.safetensors", part), desc: "BF16 / MTP / 视觉分片", exists: false, size_gb: 0)
+        } + (0..<10).map { part in
+            ModelFileItem(name: String(format: "model-plefp8-%05d.safetensors", part), desc: "FP8 PLE 查表分片", exists: false, size_gb: 0)
+        }
+    ),
+    OpenModelSpec(
         id: "qwen_image_21",
         nameZh: "Qwen-Image-2.1",
         nameEn: "Qwen-Image-2.1",
@@ -3164,7 +3192,7 @@ class StudioViewModel: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = [
                 "model_id": targetModel,
-                "precision_mode": targetModel == "qwen38_flash_next_nvfp4" ? "nvfp4" : "bf16",
+                "precision_mode": ["qwen38_flash_next_nvfp4", "qwen38_flash_next_modelopt_sglang"].contains(targetModel) ? "nvfp4" : "bf16",
                 "offload_mode": selectedOffload,
                 "context_length": contextLengthTokens,
                 "hf_token": hfToken

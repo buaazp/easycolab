@@ -523,7 +523,8 @@ def cmd_wake(gpu_type: str, app_py_path: str):
     vllm_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_vllm.py")
     transfer_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_transfer.py")
     monitor_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_monitor.py")
-    if not all(os.path.isfile(path) for path in (app_py_path, tunnel_module_path, vllm_module_path, transfer_module_path, monitor_module_path)):
+    sglang_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_sglang.py")
+    if not all(os.path.isfile(path) for path in (app_py_path, tunnel_module_path, vllm_module_path, transfer_module_path, monitor_module_path, sglang_module_path)):
         print("WAKE_ERROR: 缺少服务端 Python 资源，请重新编译或更新客户端 (missing server resources)", flush=True)
         return
 
@@ -595,6 +596,7 @@ def cmd_wake(gpu_type: str, app_py_path: str):
         contents.upload(vllm_module_path, "content/easycolab_vllm.py")
         contents.upload(transfer_module_path, "content/easycolab_transfer.py")
         contents.upload(monitor_module_path, "content/easycolab_monitor.py")
+        contents.upload(sglang_module_path, "content/easycolab_sglang.py")
         for up_attempt in range(4):
             try:
                 contents.upload(app_py_path, "content/app.py")

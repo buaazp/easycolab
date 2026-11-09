@@ -36,6 +36,38 @@ Optimized out of the box for **Google Colab G4 (`NVIDIA RTX PRO 6000 Blackwell` 
 
 ## Quick Start
 
+### Experimental ModelOpt NVFP4 Backend: SGLang / Penny Royal
+
+The catalog now includes **OrcaRouter Flash-Next ModelOpt · Penny Royal** alongside the existing `orcarouter/...-NVFP4` vLLM model. Existing weights, vLLM runtime and launch options remain unchanged.
+
+- Model: [`jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4`](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4), revision `f24d2b68ff2814f24455ae86717be276619b5664`: 206 weight files, **125.91 GiB**, including roughly 47.7 GiB of FP8 PLE tables. This is a separate quantization of the same source, not renamed old weights.
+- Runtime: Penny Royal 3.1.6, source `202f266be2d46453e098792fa39057e859fb8095`, isolated under `.easycolab-pennyroyal`. API requests use the new full repository ID; internal ID is `qwen38_flash_next_modelopt_sglang`. No silent vLLM fallback.
+- Initial experimental profile: one SM120 RTX PRO 6000 96GB, at least 72 GiB available RAM, 4K–32K context, one request, ModelOpt NVFP4, FP8 PLE on CPU, native NEXTN MTP (3 steps / 4 tokens), small CUDA Graphs and BF16 KV. Penny Royal converts eligible dense projections, HC and lm_head to rowwise FP8 online; not every BF16 shard executes in BF16. No 524K, FR-Spec, HiCache/NIXL or DFlash2 yet; full Penny Royal benchmark numbers do not apply.
+- Weight download and Drive verification reuse existing byte-based tracking but store under separate `models/jpezzulli/...` paths. Loading needs approximately 126 GiB of local SSD plus a 22 GiB margin, with at least 25 GiB more for environment builds. A Colab disk retaining the old 171 GiB cache may not fit both; old files are never deleted automatically.
+- Source builds need Linux, a CUDA 13.3 toolkit, compatible C/C++ compilers, Rust/Cargo, Python 3.12 (preferred) and Git. Override toolchains through `EASYCOLAB_SGLANG_CUDA_HOME`, `EASYCOLAB_SGLANG_CC`, and `EASYCOLAB_SGLANG_CXX`. Installing a toolkit does not upgrade Colab's host driver; only the combination recorded below has been hardware-tested.
+- Run `python easycolab_sglang.py preflight`, then `python easycolab_sglang.py prepare` on the GPU host, or provide `EASYCOLAB_SGLANG_PYTHON=/path/to/pennyroyal/.venv/bin/python`. Never point it at `.easycolab-vllm-venv`. Failed setup does not unload the old model; actually switching models requires unloading it because both cannot reside on one card.
+
+Colab Ubuntu 24.04's GCC 13 does not support the `__has_feature` macro used by this FlashInfer patch; compilation was observed to fail. Fresh instances require system-toolchain setup; the app does not install system packages or upgrade drivers automatically. Run the following in the **Colab GPU terminal**, with root access and NVIDIA's CUDA apt repository already configured, not on your Mac/Windows host:
+
+```bash
+apt-get update -qq
+apt-get install -y --no-install-recommends cuda-toolkit-13-3 gcc-14 g++-14 build-essential pkg-config libssl-dev protobuf-compiler python3.12-dev ninja-build
+curl --fail --location --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/easycolab-rustup.sh
+sh /tmp/easycolab-rustup.sh -y --profile minimal --default-toolchain stable
+export PATH="$HOME/.cargo/bin:$PATH"
+export EASYCOLAB_SGLANG_CUDA_HOME=/usr/local/cuda-13.3
+export EASYCOLAB_SGLANG_CC=/usr/bin/gcc-14
+export EASYCOLAB_SGLANG_CXX=/usr/bin/g++-14
+python easycolab_sglang.py preflight
+python easycolab_sglang.py prepare
+```
+
+The isolated bootstrap includes `wheel-stub==0.5.0`, required by NVIDIA's `cuda-tile` prerelease packaging to locate its official wheel. Do not bypass the SM120 build or remove quantization settings to silence compatibility errors.
+
+**Hardware smoke test, 2026-11-09:** one Colab RTX PRO 6000 96GB, driver 580.82.07, CUDA Toolkit 13.3.1, GCC 14 and Python 3.12 successfully built the SM120 fused MoE kernel and started the 4K profile. Reading 206 weight shards from local SSD took about 7m53s; the complete main-model loading stage took about 500s, plus another 206s for MTP. The first startup through completion of two requests took about 795s, including online conversion, JIT and warmup but excluding dependency installation. Target-verify and draft decode/extend CUDA Graph capture succeeded; upstream automatically disabled prefill graphs. Health returned 200; the English request returned `OK`, and the Chinese request returned a complete relevant sentence. This verifies basic inference, not a controlled comparison against vLLM. 32K, multimodal input, tool calls and long-running stability still need hardware testing. After Drive synchronization, rclone verified 219 matching files; the compiled environment and SSD cache are still ephemeral.
+
+Sources: [pinned Penny Royal build guide](https://github.com/jpezzulli/sglang-rtxpro6000/blob/pennyroyal-v3.1.6/BUILD.md), [checkpoint card](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4), and [SGLang single-GPU recipe](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next). Catalog presence alone is not evidence of validated performance or stability.
+
 ### Qwen3.8-Flash-Next NVFP4 on one G4 96GB GPU
 
 The catalog includes [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4), pinned to `9c6f1345b523a9d9d70b41542a63b39e3c9b7ca6`. It is **not the 27B model**: 17 main shards plus MTP total **170.9 GiB / 183.5 GB**. The large BF16 PLE shard is about **95.4 GiB**; excluding PLE and MTP leaves about **70.7 GiB** of main weights, before runtime, vision and KV memory.

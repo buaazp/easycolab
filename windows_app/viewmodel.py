@@ -1677,7 +1677,7 @@ class EasyColabViewModel(QObject):
 
         payload = {
             "model_id": target_model,
-            "precision_mode": "nvfp4" if self.selected_model_id == "qwen38_flash_next_nvfp4" else self.selected_precision,
+            "precision_mode": "nvfp4" if self.selected_model_id in {"qwen38_flash_next_nvfp4", "qwen38_flash_next_modelopt_sglang"} else self.selected_precision,
             "offload_mode": self.selected_offload,
             "context_length": self.context_length_tokens,
             "hf_token": self.hf_token.strip(),

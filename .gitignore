@@ -16,6 +16,7 @@ dist/
 # Python Virtual Environments & Bytecode
 .venv/
 .easycolab-vllm-venv/
+.easycolab-pennyroyal/
 .venv_win/
 venv/
 ENV/

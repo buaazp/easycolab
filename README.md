@@ -37,6 +37,38 @@
 
 ## 快速开始
 
+### 新增实验后端：ModelOpt NVFP4 / SGLang · Penny Royal
+
+模型列表中新增 **OrcaRouter Flash-Next ModelOpt · Penny Royal**，与原来的 `orcarouter/...-NVFP4` vLLM 模型并存，不修改旧权重、旧 vLLM 环境或启动参数。
+
+- 仓库：[`jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4`](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4)，固定 revision `f24d2b68ff2814f24455ae86717be276619b5664`。206 个权重文件、约 **125.91 GiB**，FP8 PLE 表约 47.7 GiB；这是同源原模的另一套量化，不是旧 NVFP4 的重命名。
+- 后端：独立 Penny Royal 3.1.6，固定源码 `202f266be2d46453e098792fa39057e859fb8095`，目录 `.easycolab-pennyroyal`。新 API model ID 使用完整的新仓库名，内部 ID 为 `qwen38_flash_next_modelopt_sglang`，不会静默回退到 vLLM。
+- 初始实验配置：单张 SM120 RTX PRO 6000 96GB、至少 72 GiB 可用 RAM、4K–32K 上下文、单并发、ModelOpt NVFP4、FP8 PLE→CPU、NEXTN MTP 3 步/4 token、小规模 CUDA Graph、BF16 KV。Penny Royal 会对适用的 dense projection、HC 和 lm_head 在线转为 rowwise FP8，并非所有 BF16 分片都以 BF16 执行。暂不启用 524K、FR-Spec、HiCache/NIXL 或 DFlash2，不能套用完整 Penny Royal 配方的性能数字。
+- 下载、Drive 字节进度与远端确认复用现有流程，但使用独立 `models/jpezzulli/...` 目录。加载需约 126 GiB SSD 缓存及 22 GiB 余量，另给构建环境留至少 25 GiB；保留旧 171 GiB 缓存的 Colab 实例通常放不下两套，不会自动删除旧模型。
+- 源码构建需要 Linux、CUDA 13.3 编译工具链、兼容 C/C++ 编译器、Rust/Cargo、Python 3.12（优先）及 Git。使用 `EASYCOLAB_SGLANG_CUDA_HOME`、`EASYCOLAB_SGLANG_CC`、`EASYCOLAB_SGLANG_CXX` 指定工具链。安装工具包不等于升级 Colab 宿主驱动；仅下述组合经过实机验证。
+- 可在 GPU 上先运行 `python easycolab_sglang.py preflight`，再运行 `python easycolab_sglang.py prepare`；或使用 `EASYCOLAB_SGLANG_PYTHON=/path/to/pennyroyal/.venv/bin/python` 接入已准备的独立环境。**不能指向 `.easycolab-vllm-venv`**。环境预检/安装失败不会卸载正在使用的旧模型；正式切换加载时两套大模型不能在同一张卡上同时驻留。
+
+Colab Ubuntu 24.04 的系统 GCC 13 不支持本版本 FlashInfer 补丁中的 `__has_feature` 宏，已实测会导致编译失败。新实例需要先准备系统工具链；应用不会自动安装系统包或升级驱动。以下在 **Colab GPU 终端**执行（需要 root 及已有 NVIDIA CUDA apt 软件源，不要在 Mac/Windows 本机执行）：
+
+```bash
+apt-get update -qq
+apt-get install -y --no-install-recommends cuda-toolkit-13-3 gcc-14 g++-14 build-essential pkg-config libssl-dev protobuf-compiler python3.12-dev ninja-build
+curl --fail --location --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/easycolab-rustup.sh
+sh /tmp/easycolab-rustup.sh -y --profile minimal --default-toolchain stable
+export PATH="$HOME/.cargo/bin:$PATH"
+export EASYCOLAB_SGLANG_CUDA_HOME=/usr/local/cuda-13.3
+export EASYCOLAB_SGLANG_CC=/usr/bin/gcc-14
+export EASYCOLAB_SGLANG_CXX=/usr/bin/g++-14
+python easycolab_sglang.py preflight
+python easycolab_sglang.py prepare
+```
+
+`wheel-stub==0.5.0` 已纳入独立构建依赖，供 NVIDIA `cuda-tile` 预发布包查找官方 wheel。不要跳过上游 SM120 内核构建或通过删除量化配置绕过错误。
+
+**2026-11-09 实机冒烟验证：**Colab 单张 RTX PRO 6000 96GB、驱动 580.82.07、CUDA Toolkit 13.3.1、GCC 14、Python 3.12，成功构建 SM120 fused MoE 内核并启动 4K 配置。206 个权重分片从本地 SSD 读取约 7 分 53 秒，完整主模型加载阶段约 500 秒，MTP 加载另用约 206 秒；首次启动至两条测试完成约 795 秒（含在线转换、JIT 和预热，不含依赖安装）。Target verify、draft decode/extend CUDA Graph 捕获成功，prefill graph 由上游自动禁用。健康检查返回 200，英文请求返回 `OK`，中文请求返回完整且相关的一句话。这里只验证了基础推理，不构成与 vLLM 的公平性能对比；32K、多模态、工具调用和长时间稳定性仍需实机验证。模型文件同步到 Drive 后经 rclone 校验 219 个文件一致；编译环境和 SSD 缓存仍随实例释放而丢失。
+
+依据：[Penny Royal 固定版本构建说明](https://github.com/jpezzulli/sglang-rtxpro6000/blob/pennyroyal-v3.1.6/BUILD.md)、[模型卡](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4)、[SGLang 单卡部署配方](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-Flash-Next)。本实验集成的实测结果与限制应单独记录，不把模型被列出等同于已经验证稳定性或速度。
+
 ### Qwen3.8-Flash-Next NVFP4：单卡 G4 96GB
 
 此模型不能全量塞进 96GB 显存。固定仓库版本 `9c6f1345b523a9d9d70b41542a63b39e3c9b7ca6` 有 17 个主分片及 MTP 文件，合计约 **170.9 GiB / 183.5 GB**；其中第二个分片约 **95.4 GiB**，对应巨大的 BF16 PLE n-gram 表。不加载 MTP、将 PLE 放在 CPU 后，其余主权重约 **70.7 GiB**，仍需为计算、视觉编码器与 KV cache 留显存。

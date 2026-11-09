@@ -20,6 +20,7 @@ from easycolab_tunnel import CloudflareTunnel, exit_on_sigterm, read_tunnel_conf
 import easycolab_vllm
 import easycolab_transfer
 import easycolab_monitor
+import easycolab_sglang
 
 PUBLIC_TUNNEL_URL, PUBLIC_TUNNEL_TOKEN = read_tunnel_config(os.environ)
 
@@ -1117,6 +1118,9 @@ def _stop_gguf_server_bundle(bundle: Optional[Dict[str, Any]]):
     if bundle and bundle.get("backend") == "vllm":
         easycolab_vllm.stop_server(bundle.pop("server_proc", None))
         return
+    if bundle and bundle.get("backend") == "sglang":
+        easycolab_sglang.stop_server(bundle.pop("server_proc", None))
+        return
     if not bundle or bundle.get("backend") != "gguf":
         return
     proc = bundle.pop("server_proc", None)
@@ -1350,6 +1354,7 @@ MINIMAX_H3_BF16_FILES = (
 # 开源旗舰多模型注册中心 (Hugging Face Top Models 2026)
 # ==============================================================================
 MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
+    easycolab_sglang.MODEL_SPEC["id"]: easycolab_sglang.MODEL_SPEC,
     easycolab_vllm.FLASH_NEXT_SPEC["id"]: easycolab_vllm.FLASH_NEXT_SPEC,
     "minimax_h3": {
         "id": "minimax_h3",
@@ -2231,8 +2236,10 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
                 previous.cancel()
             MODEL_TRANSFERS[target_id] = transfer
         transfer.start()
-        if spec.get("gated"):
+        if spec.get("gated") or spec.get("metadata_first"):
             MODEL_DOWNLOAD_STATE["message"] = "正在验证 HF 授权并下载固定版本配置（需先在模型页接受条款）..."
+            if spec.get("metadata_first") and not spec.get("gated"):
+                MODEL_DOWNLOAD_STATE["message"] = "正在获取并验证 ModelOpt 模型固定版本配置..."
             try:
                 _ensure_model_metadata(target_id, primary_dl_dir)
             except Exception as access_error:
@@ -2999,6 +3006,16 @@ def load_model_to_vram_core(
     target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     SELECTED_MODEL_ID = target_id
     spec = MODEL_CATALOG[target_id]
+    if spec.get("backend") == "sglang":
+        try:
+            easycolab_sglang.validate_hardware(torch)
+            easycolab_sglang.validate_context(ctx_len)
+            if not os.path.isfile(easycolab_sglang.runtime_python()):
+                preflight = easycolab_sglang.preflight()
+                if not preflight["ok"]:
+                    raise RuntimeError(" ".join(preflight["problems"]))
+        except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired) as hardware_error:
+            return False, str(hardware_error)
     if spec.get("backend") == "vllm":
         try:
             easycolab_vllm.validate_hardware(torch)
@@ -3030,11 +3047,17 @@ def load_model_to_vram_core(
 
     with GPU_LOCK:
         try:
+            if spec.get("backend") == "sglang":
+                def report_sglang_setup(message):
+                    touch_activity()
+                    MODEL_DOWNLOAD_STATE["message"] = message
+                    print(message)
+                easycolab_sglang.ensure_runtime(report_sglang_setup)
             total_vram_gb = torch.cuda.mem_get_info("cuda")[1] / (1024 ** 3)
             vram_limit = max(8.0, total_vram_gb - 2.5)
 
             # 计算新模型所需最小空闲显存阈值：余量充足时自动与已加载模型共驻显存！
-            if spec.get("backend") == "vllm":
+            if spec.get("backend") in ("vllm", "sglang"):
                 required_free_gb = total_vram_gb * 0.9
             elif target_id == "qwen38_27b":
                 required_free_gb = 53.0
@@ -3051,12 +3074,15 @@ def load_model_to_vram_core(
 
             if torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3) < required_free_gb and COMFYUI_STATE.get("is_running"):
                 free_comfyui_vram_core()
-            if spec.get("backend") == "vllm":
+            if spec.get("backend") in ("vllm", "sglang"):
                 evicted_names = _unload_model_locked("all")
                 free_bytes, total_bytes = torch.cuda.mem_get_info(0)
                 if free_bytes < total_bytes * 0.9:
                     raise RuntimeError("GPU 可用显存不足 90%，请先释放其他 GPU 任务再加载单卡 NVFP4。")
-                easycolab_vllm.validate_memory(_get_system_ram_gb()[1])
+                if spec.get("backend") == "sglang":
+                    easycolab_sglang.validate_memory(_get_system_ram_gb()[1])
+                else:
+                    easycolab_vllm.validate_memory(_get_system_ram_gb()[1])
             else:
                 evicted_names = _ensure_vram_for_new_model_locked(target_id, required_free_gb)
             free_before_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
@@ -3241,6 +3267,25 @@ def load_model_to_vram_core(
                 )
                 _enable_high_vram_optimizations(new_pipe, total_vram_gb=total_vram_gb, preload_vram=True)
                 mode_label = "Z-Image-Turbo · 8步极速 BF16"
+
+            elif spec.get("backend") == "sglang":
+                if hf_token.strip():
+                    os.environ["HF_TOKEN"] = hf_token.strip()
+                model_dir = _get_model_dirs(target_id)[2 if DRIVE_MOUNTED else 1]
+                _ensure_model_metadata(target_id, model_dir)
+                for filename, description in spec["files"]:
+                    existing = _find_existing_model_file(target_id, filename)
+                    if not existing:
+                        raise FileNotFoundError(f"ModelOpt 权重缺失: {filename}")
+                    _copy_model_file(existing, model_dir, filename)
+
+                def report_sglang(message):
+                    touch_activity()
+                    MODEL_DOWNLOAD_STATE["message"] = message
+                    print(message)
+
+                new_llm = easycolab_sglang.start_server(model_dir, ctx_len, report_sglang)
+                mode_label = new_llm["mode_label"]
 
             elif spec.get("backend") == "vllm":
                 if hf_token.strip():
@@ -5764,7 +5809,7 @@ def _split_thinking_and_answer(raw_text: str) -> Tuple[str, str]:
 def _is_bundle_alive(bundle: Optional[Dict[str, Any]]) -> bool:
     if not bundle:
         return False
-    if bundle.get("backend") in ("gguf", "vllm"):
+    if bundle.get("backend") in ("gguf", "vllm", "sglang"):
         proc = bundle.get("server_proc")
         return proc is not None and proc.poll() is None
     return bundle.get("model") is not None
@@ -5775,7 +5820,7 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
     if preferred_model_id:
         low = preferred_model_id.lower()
         for model_id, spec in MODEL_CATALOG.items():
-            if spec.get("backend") == "vllm" and low in (model_id.lower(), spec["repo_id"].lower(), spec["name"].lower()):
+            if spec.get("backend") in ("vllm", "sglang") and low in (model_id.lower(), spec["repo_id"].lower(), spec["name"].lower()):
                 exact_bundle = LOADED_RUNTIMES.get(model_id, {}).get("llm_bundle")
                 if _is_bundle_alive(exact_bundle):
                     return exact_bundle
@@ -5808,7 +5853,7 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
             if _is_bundle_alive(b):
                 return b
             # GGUF 子进程意外退出时清理陈旧表项
-            if b and b.get("backend") in ("gguf", "vllm"):
+            if b and b.get("backend") in ("gguf", "vllm", "sglang"):
                 _stop_gguf_server_bundle(b)
                 LOADED_RUNTIMES.pop(cid, None)
 
@@ -5821,12 +5866,12 @@ def _count_bundle_tokens(bundle: Optional[Dict[str, Any]], text: str) -> int:
     if not text:
         return 1
     if bundle is not None:
-        if bundle.get("backend") in ("gguf", "vllm"):
+        if bundle.get("backend") in ("gguf", "vllm", "sglang"):
             try:
                 opener = _make_noproxy_opener()
                 token_payload = (
                     {"model": bundle["served_model"], "prompt": text}
-                    if bundle.get("backend") == "vllm" else {"content": text}
+                    if bundle.get("backend") in ("vllm", "sglang") else {"content": text}
                 )
                 tok_req = urllib.request.Request(
                     f"{bundle['base_url']}/tokenize",
@@ -6877,8 +6922,8 @@ def _prepare_gguf_streamer_generation(
     reasoning_effort: Optional[str] = None,
 ):
     """通过驻留 GPU 的 llama-server / vLLM OpenAI 接口统一流式推理。"""
-    is_vllm = bundle.get("backend") == "vllm"
-    backend_label = "vLLM" if is_vllm else "GGUF"
+    is_vllm = bundle.get("backend") in ("vllm", "sglang")
+    backend_label = "SGLang" if bundle.get("backend") == "sglang" else ("vLLM" if is_vllm else "GGUF")
     oai_msgs, est_prompt_tokens = _hf_messages_to_gguf_openai_messages(hf_messages)
     bundle_ctx = int(bundle.get("context_length") or QWEN_CONTEXT_LENGTH)
     max_toks = max(16, min(65536, int(max_new_tokens or 16384), max(256, bundle_ctx - min(est_prompt_tokens, bundle_ctx - 256))))
@@ -7007,7 +7052,7 @@ def _prepare_gguf_streamer_generation(
                     raw_line = resp.readline()
                     if not raw_line:
                         if is_vllm and not (cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set()):
-                            raise RuntimeError("vLLM 响应流提前结束，未收到 [DONE]，请检查服务端日志。")
+                            raise RuntimeError(f"{backend_label} 响应流提前结束，未收到 [DONE]，请检查服务端日志。")
                         break
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data:"):
@@ -7137,7 +7182,7 @@ def _prepare_qwen_streamer_generation(
 ):
     """构建 Qwen3.8 (GGUF 或 BF16 Transformers) 后台流式推理任务并返回 (streamer, prompt_tokens, start_in_thinking, gen_thread, err_box, cancel_event)"""
     bundle = _get_qwen_llm_bundle(preferred_model_id=preferred_model_id)
-    if bundle is not None and bundle.get("backend") in ("gguf", "vllm"):
+    if bundle is not None and bundle.get("backend") in ("gguf", "vllm", "sglang"):
         return _prepare_gguf_streamer_generation(
             bundle=bundle,
             hf_messages=hf_messages,
@@ -7408,7 +7453,7 @@ def attach_macos_api_routes(app: FastAPI):
         print(f"[OpenAI API] POST /v1/chat/completions | model={req_model} | backend={bundle.get('backend')} | stream={stream} | thinking={enable_thinking}")
 
         hf_messages, pil_images = _normalize_to_hf_messages_and_images(
-            body.get("messages", []), protocol="openai", preserve_tool_calls=bundle.get("backend") == "vllm",
+            body.get("messages", []), protocol="openai", preserve_tool_calls=bundle.get("backend") in ("vllm", "sglang"),
         )
         hf_tools = _normalize_hf_tools(body.get("tools"), protocol="openai")
 
@@ -7703,7 +7748,7 @@ def attach_macos_api_routes(app: FastAPI):
             body.get("messages", []),
             system_prompt=body.get("system"),
             protocol="anthropic",
-            preserve_tool_calls=bundle.get("backend") == "vllm",
+            preserve_tool_calls=bundle.get("backend") in ("vllm", "sglang"),
         )
         hf_tools = _normalize_hf_tools(body.get("tools"), protocol="anthropic")
 
