@@ -30,6 +30,9 @@
      - 内置兼容 **OpenAI (`/v1/chat/completions`)** 与 **Anthropic (`/v1/messages`)** 的公网 API 网关（支持 Bearer / `x-api-key` 鉴权），可直接接入 **Claude Code**、**Cursor** 等开发工具。
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K 海报生图与多图指令修图**
      - 支持高质感中英文排版直出、双图自然语言指令修图与 8 步极速出图；所有生成的 MP4 / PNG 自动回传至本地目录（macOS: `~/Movies/EasyColab`，Windows: `%USERPROFILE%\Videos\EasyColab`）。
+  5. **`DeepSeek-V4-Pro-9B-UNCENSORED (Heretic · BF16)` · 18.0 GB 轻量推理与去审查对话**
+     - 由 DeepSeek-V4-Pro 蒸馏的 9B 推理模型（Qwen3.5 架构 + 视觉塔），经 Heretic 任意秩消融去除拒答，保留数学 / STEM 长思维链与工具调用能力。
+     - 仅需约 `20 GB` 显存即可满血 BF16 运行（L4 24GB 可用），并同样接入 OpenAI / Anthropic 双协议网关与多模型显存共驻。
 
 ---
 
@@ -142,6 +145,7 @@ python windows_app/easycolab_win.py
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) & [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager)
 - [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
 - [Qwen](https://github.com/QwenLM) & [Unsloth](https://github.com/unslothai/unsloth)
+- [DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic](https://huggingface.co/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic) & [Heretic](https://heretic-project.org)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [google-colab-cli](https://pypi.org/project/google-colab-cli/)
 

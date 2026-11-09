@@ -30,6 +30,9 @@ Optimized out of the box for **Google Colab G4 (`NVIDIA RTX PRO 6000 Blackwell` 
      - Built-in public API gateway compatible with both **OpenAI (`/v1/chat/completions`)** and **Anthropic (`/v1/messages`)** (with Bearer / `x-api-key` authentication), ready to plug directly into **Claude Code**, **Cursor**, and custom agent workflows.
   4. **`Qwen-Image-2.1` & `Z-Image-Turbo` · 2K Poster Generation & Multi-Image Instruction Editing**
      - High-fidelity bilingual typography rendering, natural-language multi-image editing, and 8-step ultra-fast photorealistic generation. All generated MP4 videos and PNG images are automatically pulled back to your local machine (macOS: `~/Movies/EasyColab`, Windows: `%USERPROFILE%\Videos\EasyColab`).
+  5. **`DeepSeek-V4-Pro-9B-UNCENSORED (Heretic · BF16)` · 18.0 GB Lightweight Reasoning & Decensored Chat**
+     - A 9B reasoning model distilled from DeepSeek-V4-Pro (Qwen3.5 architecture with vision tower), decensored via Heretic arbitrary-rank ablation while retaining math / STEM chain-of-thought and tool calling.
+     - Runs in full native BF16 within ~`20 GB` VRAM (fits an L4 24 GB), and is wired into the same OpenAI / Anthropic dual-protocol gateway and multi-model VRAM co-residency.
 
 ---
 
@@ -135,6 +138,7 @@ Special thanks to the following open-source projects and model teams:
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) & [ComfyUI-Manager](https://github.com/ltdrdata/ComfyUI-Manager)
 - [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
 - [Qwen](https://github.com/QwenLM) & [Unsloth](https://github.com/unslothai/unsloth)
+- [DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic](https://huggingface.co/xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic) & [Heretic](https://heretic-project.org)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [google-colab-cli](https://pypi.org/project/google-colab-cli/)
 

@@ -562,10 +562,12 @@ class EasyColabMainWindow(QMainWindow):
         return card
 
     def _build_sidebar_card3_models(self) -> SidebarCard:
-        self.model_center_badge = PillBadge("HF Top 6", fg="#60A5FA", bg="rgba(59,130,246,0.16)")
+        self.model_center_badge = PillBadge(
+            f"HF Top {len(OPEN_MODEL_CATALOG)}", fg="#60A5FA", bg="rgba(59,130,246,0.16)"
+        )
         card = SidebarCard(tr("开源模型中心", "Open Model Center"), trailing=self.model_center_badge)
 
-        # 6 Model Selector Buttons
+        # Model Selector Buttons
         self._model_card_btns: Dict[str, QPushButton] = {}
         for spec in OPEN_MODEL_CATALOG:
             btn = QPushButton()
@@ -2246,7 +2248,7 @@ class EasyColabMainWindow(QMainWindow):
             )
             self.model_center_badge.set_badge_style("#059669", "rgba(16,185,129,0.14)")
         else:
-            self.model_center_badge.setText("HF Top 6")
+            self.model_center_badge.setText(f"HF Top {len(OPEN_MODEL_CATALOG)}")
             self.model_center_badge.set_badge_style(blue_badge_fg, "rgba(59,130,246,0.14)")
 
         for m_spec in OPEN_MODEL_CATALOG:
@@ -2836,6 +2838,10 @@ class EasyColabMainWindow(QMainWindow):
             repo = "unsloth/Qwen3.8-27B-GGUF"
         elif self.vm.selected_model_id == "qwen38_27b":
             repo = "Qwen/Qwen3.8-27B"
+        elif self.vm.selected_model_id == "deepseek_v4_9b_heretic":
+            repo = "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"
+        elif "deepseek_v4_9b_heretic" in self.vm.loaded_model_ids:
+            repo = "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"
         elif "qwen38_27b_gguf" in self.vm.loaded_model_ids and "qwen38_27b" not in self.vm.loaded_model_ids:
             repo = "unsloth/Qwen3.8-27B-GGUF"
         else:
@@ -2924,7 +2930,7 @@ class EasyColabMainWindow(QMainWindow):
         if not self.api_key_input.hasFocus():
             self.api_key_input.setText(self.vm.api_access_key)
 
-        disp_name = "Qwen3.8-27B-GGUF" if "GGUF" in sn["repo"] else "Qwen3.8-27B"
+        disp_name = self.vm.active_llm_display_name
         if not self.vm.is_qwen_loaded_in_vram:
             self.api_coresident_hint.setText(
                 tr(

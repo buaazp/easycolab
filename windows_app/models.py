@@ -195,6 +195,14 @@ _SERVER_REGEX_RULES: List[Tuple[re.Pattern[str], object]] = [
         r"Checking free VRAM and loading \1 onto GPU...",
     ),
     (
+        re.compile(r"^正在装载 (.+?) BF16 原生满血权重 \(上下文上限 (.+?)\)\.\.\.$"),
+        r"Loading \1 native BF16 weights (context cap \2)...",
+    ),
+    (
+        re.compile(r"^正在装载 (.+?) BF16 原生权重 \(上下文上限 (.+?)\)\.\.\.$"),
+        r"Loading \1 native BF16 weights (context cap \2)...",
+    ),
+    (
         re.compile(r"^\[显存常驻加速\] 正在将子模块 (.+?) 预热锁入 GPU 显存\.\.\.$"),
         r"[VRAM Pinning] Locking submodule \1 into GPU VRAM...",
     ),
@@ -723,6 +731,61 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
                 desc="Unsloth MTP 多词元投机解码头 (1.31 GB)",
                 desc_en="Unsloth MTP Speculative Head (1.31 GB)",
             ),
+        ],
+    ),
+    OpenModelSpec(
+        id="deepseek_v4_9b_heretic",
+        name_zh="DeepSeek-V4-Pro-9B-UNCENSORED",
+        name_en="DeepSeek-V4-Pro-9B-UNCENSORED",
+        repo_id="xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        badge_zh="Heretic 去审查 · 18.0 GB",
+        badge_en="Heretic Decensored · 18.0 GB",
+        summary_zh="由 DeepSeek-V4-Pro 蒸馏的 9B 推理模型（Qwen3.5 架构），经 Heretic 任意秩消融去除拒答，保留数学与 STEM 长思维链能力",
+        summary_en="9B reasoning model distilled from DeepSeek-V4-Pro (Qwen3.5 architecture), decensored via Heretic arbitrary-rank ablation while retaining math & STEM chain-of-thought",
+        approx_size_gb=18.0,
+        icon="brain.head.profile",
+        modality=ModelModality.LLM_VLM,
+        default_steps=20,
+        modes=[
+            TaskModeItem(
+                id="chat",
+                title_zh="深度推理对话",
+                title_en="Deep Reasoning Chat",
+                subtitle_zh="DeepSeek-V4-Pro 蒸馏思维链，擅长数学、STEM 推理与代码架构，且不再无谓拒答",
+                subtitle_en="DeepSeek-V4-Pro distilled chain-of-thought for math, STEM & coding with minimal refusals",
+                icon="bubble.left.and.bubble.right",
+            ),
+            TaskModeItem(
+                id="vlm",
+                title_zh="图像视觉理解",
+                title_en="Vision Understanding",
+                subtitle_zh="拖入图片进行画面解析、OCR 识别或反推专业生图/生视频提示词",
+                subtitle_en="Drop images for scene analysis, OCR, or reverse-engineering image/video prompts",
+                icon="eye",
+            ),
+            TaskModeItem(
+                id="api",
+                title_zh="API 协议网关",
+                title_en="API Protocol Gateway",
+                subtitle_zh="提供 OpenAI (/v1) 与 Anthropic (/v1/messages) 双协议公网接口",
+                subtitle_en="Dual-protocol public gateway supporting OpenAI (/v1) & Anthropic (/v1/messages)",
+                icon="network",
+            ),
+        ],
+        default_files=[
+            ModelFileItem(
+                name=f"model-{i:05d}-of-00004.safetensors",
+                desc=f"权重分片 {i}/4",
+                desc_en=f"Weight Shard {i}/4",
+            )
+            for i in range(1, 5)
+        ]
+        + [
+            ModelFileItem(
+                name="model-mtp.safetensors",
+                desc="MTP 多词元投机解码头 (0.49 GB)",
+                desc_en="MTP Speculative Head (0.49 GB)",
+            )
         ],
     ),
     OpenModelSpec(

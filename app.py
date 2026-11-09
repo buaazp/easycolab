@@ -1106,6 +1106,20 @@ def _is_llm_model_id(model_id: Optional[str]) -> bool:
     return MODEL_CATALOG.get(model_id, {}).get("modality") == "llm_vlm"
 
 
+_LLM_MODEL_IDS = ("qwen38_27b", "qwen38_27b_gguf", "deepseek_v4_9b_heretic")
+
+
+def _llm_bundle_display_name(bundle: Optional[Dict[str, Any]]) -> str:
+    """返回 LLM 运行时的展示名称（GGUF / BF16 变体自动区分）"""
+    if not bundle:
+        return "LLM"
+    mid = str(bundle.get("model_id") or "")
+    spec = MODEL_CATALOG.get(mid)
+    if spec is not None:
+        return spec["name"]
+    return "LLM"
+
+
 def _stop_gguf_server_bundle(bundle: Optional[Dict[str, Any]]):
     if not bundle or bundle.get("backend") != "gguf":
         return
@@ -1349,6 +1363,19 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
             ("MTP/mtp-Qwen3.8-27B-Q4_0.gguf", "Unsloth MTP 多词元并行投机解码头 (约 1.31 GB)"),
         ],
     },
+    "deepseek_v4_9b_heretic": {
+        "id": "deepseek_v4_9b_heretic",
+        "name": "DeepSeek-V4-Pro-9B-UNCENSORED",
+        "repo_id": "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        "modality": "llm_vlm",
+        "category": "DeepSeek-V4-Pro 蒸馏 9B 推理模型 · Heretic 去审查 · BF16 原生",
+        "approx_size_gb": 18.0,
+        "files": [
+            (f"model-{i:05d}-of-00004.safetensors", f"DeepSeek-V4-Pro-9B BF16 权重分片 {i}/4")
+            for i in range(1, 5)
+        ]
+        + [("model-mtp.safetensors", "MTP 多词元投机解码头 (约 0.49 GB)")],
+    },
     "qwen_image_21": {
         "id": "qwen_image_21",
         "name": "Qwen-Image-2.1",
@@ -1384,6 +1411,9 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         ],
     },
 }
+
+# 通过 Transformers AutoModel 按「模型目录」加载的 LLM（需在权重同目录内软链分片并补齐 config/tokenizer 文件）
+TRANSFORMERS_DIR_MODEL_IDS = ("qwen38_27b", "deepseek_v4_9b_heretic")
 
 DEFAULT_OUTPUT_DIR = (
     "/content/drive/MyDrive/EasyColab_Outputs"
@@ -2059,8 +2089,8 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             MODEL_DOWNLOAD_STATE["progress"] = round(base_prog + 0.04, 2)
 
             if existing:
-                # 若使用 Qwen3.8-27B，确保同一目录内有软链接以便 AutoModel 直接按目录加载
-                if target_id == "qwen38_27b":
+                # 若使用 Transformers 原生目录加载的 LLM (Qwen3.8-27B / DeepSeek-V4-Pro-9B)，确保同一目录内有软链接以便 AutoModel 直接按目录加载
+                if target_id in TRANSFORMERS_DIR_MODEL_IDS:
                     target_link = os.path.join(primary_dl_dir, fname)
                     os.makedirs(os.path.dirname(target_link), exist_ok=True)
                     if os.path.abspath(existing) != os.path.abspath(target_link) and not os.path.exists(target_link):
@@ -2108,6 +2138,12 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             elif target_id == "qwen38_27b":
                 snapshot_download(
                     repo_id="Qwen/Qwen3.8-27B",
+                    local_dir=primary_dl_dir,
+                    ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
+                )
+            elif target_id == "deepseek_v4_9b_heretic":
+                snapshot_download(
+                    repo_id="xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
                     local_dir=primary_dl_dir,
                     ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
                 )
@@ -2643,7 +2679,7 @@ def _sync_legacy_globals():
     if _is_llm_model_id(SELECTED_MODEL_ID) and SELECTED_MODEL_ID in LOADED_RUNTIMES:
         LLM_BUNDLE = LOADED_RUNTIMES[SELECTED_MODEL_ID].get("llm_bundle")
     if LLM_BUNDLE is None:
-        for llm_id in ("qwen38_27b_gguf", "qwen38_27b"):
+        for llm_id in ("qwen38_27b_gguf", "qwen38_27b", "deepseek_v4_9b_heretic"):
             rt = LOADED_RUNTIMES.get(llm_id)
             if rt and rt.get("llm_bundle") is not None:
                 LLM_BUNDLE = rt["llm_bundle"]
@@ -2777,6 +2813,63 @@ def _ensure_vram_for_new_model_locked(target_id: str, required_free_gb: float) -
     return evicted
 
 
+def _load_transformers_llm(
+    model_id: str,
+    first_shard_name: str,
+    repo_id: str,
+    display_name: str,
+    ctx_len: int,
+    fast_fusion: bool = True,
+):
+    """按「模型目录」加载 Qwen3.5 架构系 (Qwen3_5ForConditionalGeneration) BF16 原生多模态 LLM。
+
+    统一负责：定位权重目录 -> 补齐 config/tokenizer -> AutoProcessor/AutoModelForImageTextToText 装载 ->
+    可选启用 FLA Triton 线性注意力算子融合与 CUDAGraph 静态图解码。
+    """
+    first_shard = _find_existing_model_file(model_id, first_shard_name)
+    model_dir = os.path.dirname(first_shard) if first_shard else _get_model_dirs(model_id)[2]
+
+    # 确保配置文件在同一目录中完备
+    if not os.path.exists(os.path.join(model_dir, "config.json")):
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=model_dir,
+            ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
+        )
+
+    def _load_bf16():
+        _ensure_torchaudio_compatible()
+        _ensure_qwen_fast_kernels()
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+        processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+        mdl = AutoModelForImageTextToText.from_pretrained(
+            model_dir,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+            device_map="cuda",
+            trust_remote_code=True,
+        )
+        mode_tag = f"{display_name} · BF16 原生 · {ctx_len // 1024}K"
+        print("[加速引擎] 已启用 FLA Triton 线性注意力 + Triton 融合 CausalConv1d + PyTorch SDPA！")
+        mdl.eval()
+        if fast_fusion:
+            _optimize_qwen35_for_fast_inference(mdl, max_context_len=ctx_len)
+        return mdl, processor, mode_tag
+
+    try:
+        return _load_bf16()
+    except (KeyError, ValueError, ImportError) as up_e:
+        print(f"检测到旧版 transformers ({up_e})，正在自动升级最新 transformers...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "qwen-vl-utils"]
+        )
+        import importlib
+        import transformers
+        importlib.reload(transformers)
+        return _load_bf16()
+
+
 def load_model_to_vram_core(
     model_id: Optional[str] = None,
     precision_mode: str = "bf16",
@@ -2828,6 +2921,10 @@ def load_model_to_vram_core(
             # 计算新模型所需最小空闲显存阈值：余量充足时自动与已加载模型共驻显存！
             if target_id == "qwen38_27b":
                 required_free_gb = 53.0
+            elif target_id == "deepseek_v4_9b_heretic":
+                # BF16 9B 权重约 18GB + 仅 8 层全注意力 KV (4 KV heads × 256 dim, 32K≈1GB / 256K≈8GB) + 视觉塔
+                ds_kv_gb = (ctx_len / 262144.0) * 8.0
+                required_free_gb = min(max(20.0, 19.5 + ds_kv_gb), max(12.0, total_vram_gb - 1.2))
             elif target_id == "qwen38_27b_gguf":
                 q4_kv_gb = (ctx_len / 262144.0) * 4.6
                 required_free_gb = min(max(20.8, 20.6 + q4_kv_gb), max(12.0, total_vram_gb - 1.2))
@@ -3041,53 +3138,49 @@ def load_model_to_vram_core(
                 MODEL_DOWNLOAD_STATE["message"] = (
                     f"正在装载 Qwen3.8-27B BF16 原生满血权重 (上下文上限 {ctx_len // 1024}K)..."
                 )
-                first_shard = _find_existing_model_file("qwen38_27b", "model-00001-of-00018.safetensors")
-                model_dir = os.path.dirname(first_shard) if first_shard else _get_model_dirs("qwen38_27b")[2]
-
-                # 确保配置文件在同一目录中完备
-                if not os.path.exists(os.path.join(model_dir, "config.json")):
-                    from huggingface_hub import snapshot_download
-                    snapshot_download(
-                        repo_id="Qwen/Qwen3.8-27B",
-                        local_dir=model_dir,
-                        ignore_patterns=["*.safetensors", "*.bin", "*.pth"],
-                    )
-
-                def _load_qwen_vl_bf16():
-                    _ensure_torchaudio_compatible()
-                    _ensure_qwen_fast_kernels()
-                    from transformers import AutoProcessor, AutoModelForImageTextToText
-                    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
-                    mdl = AutoModelForImageTextToText.from_pretrained(
-                        model_dir,
-                        dtype=torch.bfloat16,
-                        attn_implementation="sdpa",
-                        device_map="cuda",
-                        trust_remote_code=True,
-                    )
-                    mode_tag = f"Qwen3.8-27B · BF16 原生 · {ctx_len // 1024}K"
-                    print("[加速引擎] 已启用 FLA Triton 线性注意力 + Triton 融合 CausalConv1d + PyTorch SDPA！")
-                    mdl.eval()
-                    _optimize_qwen35_for_fast_inference(mdl, max_context_len=ctx_len)
-                    return mdl, processor, mode_tag
-
-                try:
-                    mdl, proc, mode_tag = _load_qwen_vl_bf16()
-                except (KeyError, ValueError, ImportError) as up_e:
-                    print(f"检测到旧版 transformers ({up_e})，正在自动升级最新 transformers...")
-                    subprocess.check_call(
-                        [sys.executable, "-m", "pip", "install", "-q", "-U", "transformers", "accelerate", "qwen-vl-utils"]
-                    )
-                    import importlib
-                    import transformers
-                    importlib.reload(transformers)
-                    mdl, proc, mode_tag = _load_qwen_vl_bf16()
-
+                mdl, proc, mode_tag = _load_transformers_llm(
+                    target_id,
+                    first_shard_name="model-00001-of-00018.safetensors",
+                    repo_id="Qwen/Qwen3.8-27B",
+                    display_name="Qwen3.8-27B",
+                    ctx_len=ctx_len,
+                    fast_fusion=True,
+                )
                 new_llm = {
                     "backend": "transformers",
                     "model": mdl,
                     "processor": proc,
                     "model_id": "qwen38_27b",
+                    "context_length": ctx_len,
+                }
+                mode_label = mode_tag
+
+            elif target_id == "deepseek_v4_9b_heretic":
+                if free_before_gb < 19.5:
+                    raise RuntimeError(
+                        f"当前 GPU 可用显存 ({free_before_gb:.1f} GB / 总计 {total_vram_gb:.1f} GB) 不足以加载 "
+                        f"{spec['name']} BF16 原生权重（需约 20 GB 显存，推荐 L4 24GB 及以上）。"
+                        f"可先卸载其他常驻模型，或调低上下文长度后重试。"
+                    )
+
+                MODEL_DOWNLOAD_STATE["progress"] = 0.30
+                MODEL_DOWNLOAD_STATE["message"] = (
+                    f"正在装载 {spec['name']} BF16 原生权重 (上下文上限 {ctx_len // 1024}K)..."
+                )
+                mdl, proc, mode_tag = _load_transformers_llm(
+                    target_id,
+                    first_shard_name="model-00001-of-00004.safetensors",
+                    repo_id="xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+                    display_name="DeepSeek-V4-Pro-9B-UNCENSORED",
+                    ctx_len=ctx_len,
+                    # 9B 蒸馏模型仅 32 层，融合算子收益有限且需逐模型验证，默认走官方 SDPA 路径
+                    fast_fusion=False,
+                )
+                new_llm = {
+                    "backend": "transformers",
+                    "model": mdl,
+                    "processor": proc,
+                    "model_id": "deepseek_v4_9b_heretic",
                     "context_length": ctx_len,
                 }
                 mode_label = mode_tag
@@ -5547,17 +5640,19 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
     candidates: List[str] = []
     if preferred_model_id:
         low = preferred_model_id.lower()
-        if preferred_model_id in ("qwen38_27b", "qwen38_27b_gguf"):
+        if preferred_model_id in _LLM_MODEL_IDS:
             candidates.append(preferred_model_id)
         elif "gguf" in low or "q4_k" in low or "unsloth" in low:
             candidates.append("qwen38_27b_gguf")
+        elif "deepseek" in low or "heretic" in low or "xtools" in low:
+            candidates.append("deepseek_v4_9b_heretic")
         elif "qwen3.8" in low or "qwen38" in low:
             candidates.extend(["qwen38_27b_gguf", "qwen38_27b"])
 
     if _is_llm_model_id(SELECTED_MODEL_ID) and SELECTED_MODEL_ID not in candidates:
         candidates.append(SELECTED_MODEL_ID)
 
-    for fallback_id in ("qwen38_27b_gguf", "qwen38_27b"):
+    for fallback_id in ("qwen38_27b_gguf", "qwen38_27b", "deepseek_v4_9b_heretic"):
         if fallback_id not in candidates:
             candidates.append(fallback_id)
 
@@ -5605,7 +5700,7 @@ def _count_bundle_tokens(bundle: Optional[Dict[str, Any]], text: str) -> int:
 
 
 def _run_qwen_llm_job(job_id: str, req: GenerateVideoRequest, target_llm_id: Optional[str] = None):
-    """运行 Qwen3.8-27B (BF16 原生 或 Unsloth UD-Q4_K_M GGUF) 深度推理对话与多模态视觉理解"""
+    """运行 LLM/VLM (Qwen3.8-27B BF16 / GGUF, DeepSeek-V4-Pro-9B) 深度推理对话与多模态视觉理解"""
     global QWEN_CONTEXT_LENGTH
     start_time = time.time()
     if req.context_length is not None:
@@ -5614,10 +5709,10 @@ def _run_qwen_llm_job(job_id: str, req: GenerateVideoRequest, target_llm_id: Opt
     bundle = _get_qwen_llm_bundle(preferred_model_id=target_llm_id or req.model_id)
     if bundle is None:
         JOBS[job_id]["status"] = "failed"
-        JOBS[job_id]["message"] = "Qwen3.8-27B 尚未加载至 GPU 显存！请先在左侧点击「加载到显存」。"
+        JOBS[job_id]["message"] = "LLM 尚未加载至 GPU 显存！请先在左侧点击「加载到显存」。"
         return
 
-    model_label = "Qwen3.8-27B-GGUF" if bundle.get("backend") == "gguf" else "Qwen3.8-27B"
+    model_label = _llm_bundle_display_name(bundle)
     first_img = decode_base64_image(req.first_frame_base64)
     last_img = decode_base64_image(req.last_frame_base64)
     attached_images = [im for im in (first_img, last_img) if im is not None]
@@ -5946,7 +6041,7 @@ def _run_async_generation_job(job_id: str, req: GenerateVideoRequest):
         if job_cancel_event.is_set():
             raise GenerationAbortedError("已手动停止当前推理任务")
 
-        # 分支 A：Qwen3.8-27B / Qwen3.8-27B-GGUF 视觉理解与深度推理对话
+        # 分支 A：LLM/VLM (Qwen3.8-27B BF16/GGUF, DeepSeek-V4-Pro-9B) 视觉理解与深度推理对话
         if _is_llm_model_id(active_model_id):
             _run_qwen_llm_job(job_id, req, target_llm_id=active_model_id)
             return
@@ -6962,7 +7057,8 @@ def _prepare_qwen_streamer_generation(
                     model.generate(**gen_kwargs)
             except torch.cuda.OutOfMemoryError:
                 err_box[0] = RuntimeError(
-                    "GPU 显存不足 (OOM)：BF16 原生精度长上下文峰值显存较高，建议切换使用独立的「Qwen3.8-27B-GGUF (UD-Q4_K_M)」量化模型，或适当调低上下文长度。"
+                    f"GPU 显存不足 (OOM)：{_llm_bundle_display_name(bundle)} 在 BF16 原生精度长上下文下峰值显存较高，"
+                    "建议适当调低上下文长度，或先卸载其他常驻显存模型后重试。"
                 )
                 try:
                     streamer.end()
@@ -7024,10 +7120,14 @@ def attach_macos_api_routes(app: FastAPI):
         global QWEN_CONTEXT_LENGTH
         QWEN_CONTEXT_LENGTH = _clamp_context_length(req.context_length)
         # BF16 Transformers 运行时支持直接热更新动态上下文上限；GGUF 需重载以重分配 KV 槽位
-        bf16_rt = LOADED_RUNTIMES.get("qwen38_27b")
-        if bf16_rt and bf16_rt.get("llm_bundle"):
-            bf16_rt["llm_bundle"]["context_length"] = QWEN_CONTEXT_LENGTH
-            bf16_rt["mode_label"] = f"Qwen3.8-27B · BF16 原生 · {QWEN_CONTEXT_LENGTH // 1024}K"
+        for bf16_id in ("qwen38_27b", "deepseek_v4_9b_heretic"):
+            bf16_rt = LOADED_RUNTIMES.get(bf16_id)
+            if bf16_rt and bf16_rt.get("llm_bundle"):
+                bf16_rt["llm_bundle"]["context_length"] = QWEN_CONTEXT_LENGTH
+                bf16_rt["mode_label"] = (
+                    f"{MODEL_CATALOG[bf16_id]['name']} · BF16 原生 · {QWEN_CONTEXT_LENGTH // 1024}K"
+                )
+        if LOADED_RUNTIMES:
             _sync_legacy_globals()
         touch_activity()
         print(f"[上下文配置] 目标最大上下文长度已设为 {QWEN_CONTEXT_LENGTH // 1024}K ({QWEN_CONTEXT_LENGTH} tokens)")
@@ -7058,6 +7158,20 @@ def attach_macos_api_routes(app: FastAPI):
             {"id": "Qwen3.8-27B-UD-Q4_K_M", "object": "model", "created": now_ts, "owned_by": "unsloth", "loaded": "qwen38_27b_gguf" in LOADED_RUNTIMES},
             {"id": "Qwen/Qwen3.8-27B", "object": "model", "created": now_ts, "owned_by": "qwen", "loaded": any_qwen_loaded},
             {"id": "qwen3.8-27b", "object": "model", "created": now_ts, "owned_by": "qwen", "loaded": any_qwen_loaded},
+            {
+                "id": "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+                "object": "model",
+                "created": now_ts,
+                "owned_by": "xtools-at",
+                "loaded": "deepseek_v4_9b_heretic" in LOADED_RUNTIMES,
+            },
+            {
+                "id": "deepseek-v4-pro-9b-heretic",
+                "object": "model",
+                "created": now_ts,
+                "owned_by": "xtools-at",
+                "loaded": "deepseek_v4_9b_heretic" in LOADED_RUNTIMES,
+            },
             {"id": "Qwen/Qwen-Image-2.1", "object": "model", "created": now_ts, "owned_by": "qwen", "loaded": "qwen_image_21" in LOADED_RUNTIMES},
             {"id": "Tongyi-MAI/Z-Image-Turbo", "object": "model", "created": now_ts, "owned_by": "tongyi", "loaded": "z_image_turbo" in LOADED_RUNTIMES},
             {"id": "MiniMaxAI/MiniMax-H3", "object": "model", "created": now_ts, "owned_by": "minimax", "loaded": "minimax_h3" in LOADED_RUNTIMES},
@@ -7081,7 +7195,7 @@ def attach_macos_api_routes(app: FastAPI):
                 status_code=503,
                 content={
                     "error": {
-                        "message": "Qwen3.8-27B / Qwen3.8-27B-GGUF 尚未加载至 Colab GPU 显存，请先在 Mac 客户端点击「加载到显存」。",
+                        "message": "LLM/VLM 模型尚未加载至 Colab GPU 显存，请先在客户端点击「加载到显存」。",
                         "type": "server_error",
                         "code": "model_not_loaded",
                     }
@@ -7378,7 +7492,7 @@ def attach_macos_api_routes(app: FastAPI):
                     "type": "error",
                     "error": {
                         "type": "overloaded_error",
-                        "message": "Qwen3.8-27B / Qwen3.8-27B-GGUF 尚未加载至 Colab GPU 显存，请先在 Mac 客户端点击「加载到显存」。",
+                        "message": "LLM/VLM 模型尚未加载至 Colab GPU 显存，请先在客户端点击「加载到显存」。",
                     },
                 },
             )

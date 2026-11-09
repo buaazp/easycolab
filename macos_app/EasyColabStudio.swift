@@ -433,6 +433,56 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         ]
     ),
     OpenModelSpec(
+        id: "deepseek_v4_9b_heretic",
+        nameZh: "DeepSeek-V4-Pro-9B-UNCENSORED",
+        nameEn: "DeepSeek-V4-Pro-9B-UNCENSORED",
+        repoId: "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic",
+        badgeZh: "Heretic 去审查 · 18.0 GB",
+        badgeEn: "Heretic Decensored · 18.0 GB",
+        summaryZh: "由 DeepSeek-V4-Pro 蒸馏的 9B 推理模型（Qwen3.5 架构），经 Heretic 任意秩消融去除拒答，保留数学与 STEM 长思维链能力",
+        summaryEn: "9B reasoning model distilled from DeepSeek-V4-Pro (Qwen3.5 architecture), decensored via Heretic arbitrary-rank ablation while retaining math & STEM chain-of-thought",
+        approxSizeGB: 18.0,
+        icon: "brain.head.profile",
+        modality: .llmVLM,
+        defaultSteps: 20,
+        modes: [
+            TaskModeItem(
+                id: "chat",
+                titleZh: "深度推理对话",
+                titleEn: "Deep Reasoning Chat",
+                subtitleZh: "DeepSeek-V4-Pro 蒸馏思维链，擅长数学、STEM 推理与代码架构，且不再无谓拒答",
+                subtitleEn: "DeepSeek-V4-Pro distilled chain-of-thought for math, STEM & coding with minimal refusals",
+                icon: "bubble.left.and.bubble.right"
+            ),
+            TaskModeItem(
+                id: "vlm",
+                titleZh: "图像视觉理解",
+                titleEn: "Vision Understanding",
+                subtitleZh: "拖入图片进行画面解析、OCR 识别或反推专业生图/生视频提示词",
+                subtitleEn: "Drop images for scene analysis, OCR, or reverse-engineering image/video prompts",
+                icon: "eye"
+            ),
+            TaskModeItem(
+                id: "api",
+                titleZh: "API 协议网关",
+                titleEn: "API Protocol Gateway",
+                subtitleZh: "提供 OpenAI (/v1) 与 Anthropic (/v1/messages) 双协议公网接口",
+                subtitleEn: "Public dual-protocol gateway compatible with OpenAI (/v1) & Anthropic (/v1/messages)",
+                icon: "network"
+            )
+        ],
+        defaultFiles: (1...4).map { i in
+            ModelFileItem(
+                name: String(format: "model-%05d-of-00004.safetensors", i),
+                desc: "权重分片 \(i)/4",
+                exists: false,
+                size_gb: 0
+            )
+        } + [
+            ModelFileItem(name: "model-mtp.safetensors", desc: "MTP 多词元投机解码头 (0.49 GB)", exists: false, size_gb: 0)
+        ]
+    ),
+    OpenModelSpec(
         id: "qwen_image_21",
         nameZh: "Qwen-Image-2.1",
         nameEn: "Qwen-Image-2.1",
@@ -1711,7 +1761,8 @@ class StudioViewModel: ObservableObject {
     var isQwenLoadedInVRAM: Bool {
         loadedModelIds.contains("qwen38_27b")
             || loadedModelIds.contains("qwen38_27b_gguf")
-            || (modelLoaded && (loadedModelId == "qwen38_27b" || loadedModelId == "qwen38_27b_gguf"))
+            || loadedModelIds.contains("deepseek_v4_9b_heretic")
+            || (modelLoaded && ["qwen38_27b", "qwen38_27b_gguf", "deepseek_v4_9b_heretic"].contains(loadedModelId))
     }
 
     init() {
@@ -7006,12 +7057,21 @@ struct MainStudioView: View {
         let activeLLMRepo: String = {
             if vm.selectedModelId == "qwen38_27b_gguf" { return "unsloth/Qwen3.8-27B-GGUF" }
             if vm.selectedModelId == "qwen38_27b" { return "Qwen/Qwen3.8-27B" }
+            if vm.selectedModelId == "deepseek_v4_9b_heretic" {
+                return "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"
+            }
+            if vm.loadedModelIds.contains("deepseek_v4_9b_heretic") {
+                return "xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic"
+            }
             if vm.loadedModelIds.contains("qwen38_27b_gguf") && !vm.loadedModelIds.contains("qwen38_27b") {
                 return "unsloth/Qwen3.8-27B-GGUF"
             }
             return "Qwen/Qwen3.8-27B"
         }()
-        let activeLLMDisplayName = activeLLMRepo.contains("GGUF") ? "Qwen3.8-27B-GGUF" : "Qwen3.8-27B"
+        let activeLLMDisplayName: String = {
+            if let spec = OPEN_MODEL_CATALOG.first(where: { $0.repoId == activeLLMRepo }) { return spec.name }
+            return activeLLMRepo.contains("GGUF") ? "Qwen3.8-27B-GGUF" : "Qwen3.8-27B"
+        }()
 
         let samplePrompt1 = L("用三句话解释量子纠缠，并展示思考过程", "Explain quantum entanglement in 3 sentences with reasoning")
         let samplePrompt2 = L("帮我设计一个高并发网关架构", "Design a high-concurrency API gateway architecture")

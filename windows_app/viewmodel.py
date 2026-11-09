@@ -464,7 +464,18 @@ class EasyColabViewModel(QObject):
 
     @property
     def is_qwen_loaded_in_vram(self) -> bool:
-        return ("qwen38_27b_gguf" in self.loaded_model_ids) or ("qwen38_27b" in self.loaded_model_ids)
+        return any(mid in self.loaded_model_ids for mid in ("qwen38_27b_gguf", "qwen38_27b", "deepseek_v4_9b_heretic"))
+
+    @property
+    def active_llm_display_name(self) -> str:
+        """当前网关所路由的 LLM 展示名称（优先选中项，其次显存中已常驻的 LLM 变体）"""
+        llm_ids = ("qwen38_27b_gguf", "qwen38_27b", "deepseek_v4_9b_heretic")
+        if self.selected_model_id in llm_ids:
+            return MODEL_SPEC_MAP[self.selected_model_id].name
+        for mid in llm_ids:
+            if mid in self.loaded_model_ids:
+                return MODEL_SPEC_MAP[mid].name
+        return MODEL_SPEC_MAP["qwen38_27b"].name
 
     @property
     def display_account_label(self) -> str:
