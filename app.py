@@ -8,6 +8,7 @@ import time
 import glob
 import queue
 import atexit
+import asyncio
 import socket
 import base64
 import subprocess
@@ -15,6 +16,12 @@ import threading
 from collections import deque
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict, Any
+from easycolab_tunnel import CloudflareTunnel, exit_on_sigterm, read_tunnel_config
+import easycolab_vllm
+import easycolab_transfer
+import easycolab_monitor
+
+PUBLIC_TUNNEL_URL, PUBLIC_TUNNEL_TOKEN = read_tunnel_config(os.environ)
 
 # ==============================================================================
 # 实时终端进度与 tqdm 捕获器 (将 Colab 网页端的实时下载进度同步给 macOS App)
@@ -1107,6 +1114,9 @@ def _is_llm_model_id(model_id: Optional[str]) -> bool:
 
 
 def _stop_gguf_server_bundle(bundle: Optional[Dict[str, Any]]):
+    if bundle and bundle.get("backend") == "vllm":
+        easycolab_vllm.stop_server(bundle.pop("server_proc", None))
+        return
     if not bundle or bundle.get("backend") != "gguf":
         return
     proc = bundle.pop("server_proc", None)
@@ -1190,6 +1200,8 @@ MODEL_DOWNLOAD_STATE: Dict[str, Any] = {
     "progress": 0.0,
     "message": "等待检查模型状态...",
 }
+MODEL_TRANSFERS = {}
+MODEL_TRANSFERS_LOCK = threading.RLock()
 
 
 def _get_system_ram_gb() -> Tuple[float, float]:
@@ -1335,9 +1347,10 @@ MINIMAX_H3_BF16_FILES = (
 )
 
 # ==============================================================================
-# 开源旗舰多模型注册中心 (Hugging Face Top Models 2026 · 全量免审核 Gated=False)
+# 开源旗舰多模型注册中心 (Hugging Face Top Models 2026)
 # ==============================================================================
 MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
+    easycolab_vllm.FLASH_NEXT_SPEC["id"]: easycolab_vllm.FLASH_NEXT_SPEC,
     "minimax_h3": {
         "id": "minimax_h3",
         "name": "MiniMax-H3 (33B)",
@@ -1457,6 +1470,8 @@ def fast_parallel_hf_download(
     dest_dir: str,
     hf_token: str = "",
     num_connections: int = 8,
+    revision: str = "main",
+    progress_callback=None,
 ) -> str:
     """
     使用 8 路并发 HTTP Range 连接直接从 HuggingFace CDN 下载大权重文件至内存盘/本地盘，
@@ -1467,7 +1482,7 @@ def fast_parallel_hf_download(
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     temp_path = dest_path + ".part"
 
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+    url = f"https://huggingface.co/{repo_id}/resolve/{revision}/{filename}"
     opener = urllib.request.build_opener(_StripAuthRedirectHandler())
     headers = {"User-Agent": "EasyColab/2.0"}
     token = (hf_token or os.environ.get("HF_TOKEN") or "").strip()
@@ -1488,7 +1503,10 @@ def fast_parallel_hf_download(
         # 若文件较小 (<32MB) 或未返回支持分片的大小，直接走 hf_hub_download
         if total_size < 32 * 1024 * 1024:
             from huggingface_hub import hf_hub_download
-            return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir)
+            result = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, revision=revision, token=token or None)
+            if progress_callback:
+                progress_callback(os.path.getsize(result))
+            return result
 
         with open(temp_path, "wb") as f:
             f.truncate(total_size)
@@ -1522,6 +1540,8 @@ def fast_parallel_hf_download(
                     now = time.time()
                     with dl_lock:
                         downloaded_bytes += len(buf)
+                        if progress_callback:
+                            progress_callback(downloaded_bytes)
                         if now - last_print_ts[0] >= 0.35 or downloaded_bytes >= total_size:
                             last_print_ts[0] = now
                             elapsed = max(0.001, now - start_ts)
@@ -1554,7 +1574,12 @@ def fast_parallel_hf_download(
             except Exception:
                 pass
         from huggingface_hub import hf_hub_download
-        return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir)
+        if progress_callback:
+            progress_callback(0)
+        result = hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, revision=revision, token=token or None)
+        if progress_callback:
+            progress_callback(os.path.getsize(result))
+        return result
 
 
 
@@ -1667,6 +1692,14 @@ def _get_model_dirs(model_id: str) -> Tuple[Optional[str], str, str]:
     return ram_dir, nvme_dir, drive_dir
 
 
+def _model_file_valid(model_id: str, path: str, filename: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    expected_size = MODEL_CATALOG[model_id].get("file_sizes", {}).get(filename)
+    size = os.path.getsize(path)
+    return size == expected_size if expected_size is not None else size > 64 * 1024
+
+
 def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
     """按速度优先级查找已存在的模型权重文件：1. /dev/shm 内存盘 -> 2. 本地 NVMe -> 3. Google Drive (含历史目录与 HuggingFace 缓存兼容)"""
     ram_dir, nvme_dir, drive_dir = _get_model_dirs(model_id)
@@ -1685,7 +1718,7 @@ def _find_existing_model_file(model_id: str, fname: str) -> Optional[str]:
             if os.path.isdir(leg_root):
                 candidates.append(os.path.join(leg_root, repo_sub, fname))
     for p in candidates:
-        if os.path.exists(p) and os.path.getsize(p) > 64 * 1024:
+        if _model_file_valid(model_id, p, fname):
             return p
     return None
 
@@ -1694,7 +1727,7 @@ def _model_directory_ready(model_id: str, model_dir: str) -> bool:
     return _model_metadata_ready(model_id, model_dir) and all(
         os.path.isfile(os.path.join(model_dir, filename))
         and not os.path.islink(os.path.join(model_dir, filename))
-        and os.path.getsize(os.path.join(model_dir, filename)) > 64 * 1024
+        and _model_file_valid(model_id, os.path.join(model_dir, filename), filename)
         for filename, description in MODEL_CATALOG[model_id]["files"]
     )
 
@@ -1735,6 +1768,22 @@ def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
             })
 
     all_downloaded = downloaded_count == len(req_files) and len(req_files) > 0
+    directory_ready = DRIVE_MOUNTED and _google_drive_is_mounted() and _model_directory_ready(target_id, drive_dir)
+    with MODEL_TRANSFERS_LOCK:
+        transfer = MODEL_TRANSFERS.get(target_id)
+        if transfer is None and directory_ready:
+            sizes = {filename: os.path.getsize(os.path.join(drive_dir, filename)) for filename, description in req_files}
+            transfer = easycolab_transfer.ModelTransfer(target_id, drive_dir, sizes, True, easycolab_transfer.find_rclone_mount(drive_dir))
+            for filename, size in sizes.items():
+                transfer.record(filename, size)
+            try:
+                transfer.prepare_confirmation()
+                transfer.start()
+            except (OSError, ValueError, RuntimeError):
+                transfer.upload_state = "error"
+                transfer.message = "无法校验 Drive 文件，请点击校验权重重试。"
+            MODEL_TRANSFERS[target_id] = transfer
+    transfer_state = transfer.snapshot() if transfer else {}
     return {
         "selected_model_id": target_id,
         "selected_model_name": spec["name"],
@@ -1746,12 +1795,13 @@ def check_model_files_status(model_id: Optional[str] = None) -> Dict[str, Any]:
         "all_downloaded": all_downloaded,
         "total_size_gb": round(total_size_gb, 2),
         "drive_mounted": DRIVE_MOUNTED and _google_drive_is_mounted(),
-        "drive_persisted": DRIVE_MOUNTED and _google_drive_is_mounted() and _model_directory_ready(target_id, drive_dir),
+        "drive_persisted": bool(directory_ready and transfer_state.get("upload_state") == "verified" and time.monotonic() - transfer.checked_at < 90),
         "ramdisk_enabled": ram_dir is not None,
         "ram_cached_count": ram_cached_count,
         "model_storage_path": drive_dir if DRIVE_MOUNTED else nvme_dir,
         "model_cache_path": ram_dir or nvme_dir,
         "bf16_shards_count": downloaded_count if target_id == "minimax_h3" else 0,
+        **transfer_state,
     }
 
 
@@ -1857,6 +1907,7 @@ def _sample_live_hardware_telemetry_once() -> Dict[str, Any]:
         "cu_burn_rate_per_hour": cu_rate,
     }
     snap.update(_get_storage_metrics_dict(refresh_drive=False))
+    snap.update(easycolab_monitor.MONITOR.sample())
     if "_poll_local_comfyui_runtime_quiet" in globals():
         _poll_local_comfyui_runtime_quiet()
     with _TELEMETRY_LOCK:
@@ -1969,9 +2020,16 @@ def get_gpu_status_dict(model_id: Optional[str] = None) -> Dict[str, Any]:
         "disk_total_gb", "disk_used_gb", "disk_free_gb",
         "shm_total_gb", "shm_used_gb", "shm_free_gb",
         "drive_total_gb", "drive_used_gb", "drive_free_gb",
+        "cpu_utilization_pct", "gpu_utilization_pct", "cpu_count", "sampled_at",
     ):
         base[k] = hw.get(k, 0.0)
     base.update(file_status)
+    if MODEL_DOWNLOAD_STATE["is_downloading"] and file_status.get("download_total_bytes"):
+        downloading = file_status["download_completed_bytes"] < file_status["download_total_bytes"]
+        base["task_progress"] = (
+            file_status["download_completed_bytes"] / file_status["download_total_bytes"] if downloading
+            else file_status.get("upload_confirmed_bytes", 0) / max(1, file_status.get("upload_total_bytes", 0))
+        )
     base["comfyui"] = get_comfyui_status_dict()
     return base
 
@@ -2041,17 +2099,24 @@ def build_structured_prompt(
 # ==============================================================================
 # 独立功能 1：多模型通用极速下载器 (8路并发 HTTP Range + 完整 Google Drive 持久化)
 # ==============================================================================
-def _copy_model_file(src_file: str, dst_dir: str, fname: str):
+def _copy_model_file(src_file: str, dst_dir: str, fname: str, progress_callback=None):
     """将已有缓存原子复制为目标目录中的真实文件，不保留指向临时盘的软链接。"""
     dst_file = os.path.join(dst_dir, fname)
     os.makedirs(os.path.dirname(dst_file), exist_ok=True)
     source_size = os.path.getsize(src_file)
     if os.path.isfile(dst_file) and not os.path.islink(dst_file) and os.path.getsize(dst_file) == source_size:
+        if progress_callback:
+            progress_callback(source_size)
         return
     tmp_dst = dst_file + ".syncing"
     try:
         with open(src_file, "rb") as rf, open(tmp_dst, "wb") as wf:
-            shutil.copyfileobj(rf, wf, length=32 * 1024 * 1024)
+            copied = 0
+            while chunk := rf.read(32 * 1024 * 1024):
+                wf.write(chunk)
+                copied += len(chunk)
+                if progress_callback:
+                    progress_callback(copied)
             wf.flush()
             os.fsync(wf.fileno())
         if os.path.getsize(tmp_dst) != source_size:
@@ -2071,6 +2136,8 @@ def _model_metadata_ready(model_id: str, model_dir: str) -> bool:
         spec = MODEL_CATALOG[model_id]
         files = manifest["files"]
         if manifest["repo_id"] != spec["repo_id"] or manifest.get("subdir", "") != spec.get("metadata_subdir", ""):
+            return False
+        if manifest.get("revision") != spec.get("revision"):
             return False
         if not isinstance(files, dict) or not files:
             return False
@@ -2098,7 +2165,8 @@ def _ensure_model_metadata(model_id: str, model_dir: str) -> str:
     from huggingface_hub import snapshot_download
 
     patterns = [f"{subdir}/*"] if subdir else ["*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken", "*.py"]
-    snapshot_download(repo_id=spec["repo_id"], local_dir=model_dir, allow_patterns=patterns)
+    revision_options = {"revision": spec["revision"]} if spec.get("revision") else {}
+    snapshot_download(repo_id=spec["repo_id"], local_dir=model_dir, allow_patterns=patterns, **revision_options)
     local_patterns = [f"{subdir}/**/*"] if subdir else patterns
     files = {}
     for pattern in local_patterns:
@@ -2111,7 +2179,7 @@ def _ensure_model_metadata(model_id: str, model_dir: str) -> str:
             files[filename] = os.path.getsize(path)
     manifest_path = os.path.join(model_dir, ".easycolab-metadata.json")
     with open(manifest_path + ".tmp", "w", encoding="utf-8") as stream:
-        json.dump({"repo_id": spec["repo_id"], "subdir": subdir, "files": files}, stream, ensure_ascii=False)
+        json.dump({"repo_id": spec["repo_id"], "revision": spec.get("revision"), "subdir": subdir, "files": files}, stream, ensure_ascii=False)
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(manifest_path + ".tmp", manifest_path)
@@ -2138,11 +2206,13 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
     with CONSOLE_LOCK:
         ACTIVE_TQDM_BARS.clear()
 
+    transfer = None
     try:
         if hf_token and hf_token.strip():
             os.environ["HF_TOKEN"] = hf_token.strip()
-            from huggingface_hub import login
-            login(token=hf_token.strip(), add_to_git_credential=False)
+            if not spec.get("gated"):
+                from huggingface_hub import login
+                login(token=hf_token.strip(), add_to_git_credential=False)
 
         nvme_dir, drive_dir = _get_model_dirs(target_id)[1:]
         if DRIVE_MOUNTED and not _google_drive_is_mounted():
@@ -2152,22 +2222,48 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             print("⚠️ Google Drive 未挂载：模型仅保存在实例临时磁盘，释放实例后会丢失。")
         os.makedirs(primary_dl_dir, exist_ok=True)
         total_files = len(req_files)
+        MODEL_DOWNLOAD_STATE["message"] = "正在获取权重字节大小，准备下载与 Drive 上传进度..."
+        sizes = easycolab_transfer.model_file_sizes(spec, primary_dl_dir, hf_token or os.environ.get("HF_TOKEN", ""))
+        transfer = easycolab_transfer.ModelTransfer(target_id, primary_dl_dir, sizes, DRIVE_MOUNTED, easycolab_transfer.find_rclone_mount(primary_dl_dir))
+        with MODEL_TRANSFERS_LOCK:
+            previous = MODEL_TRANSFERS.get(target_id)
+            if previous:
+                previous.cancel()
+            MODEL_TRANSFERS[target_id] = transfer
+        transfer.start()
+        if spec.get("gated"):
+            MODEL_DOWNLOAD_STATE["message"] = "正在验证 HF 授权并下载固定版本配置（需先在模型页接受条款）..."
+            try:
+                _ensure_model_metadata(target_id, primary_dl_dir)
+            except Exception as access_error:
+                raise RuntimeError(
+                    "无法获取模型配置：请在 Hugging Face 接受该仓库条款，并提供有读取权限的 HF Token；"
+                    "同时检查网络连接。"
+                ) from access_error
+            missing_bytes = sum(
+                size for filename, size in spec.get("file_sizes", {}).items()
+                if not _model_file_valid(target_id, os.path.join(primary_dl_dir, filename), filename)
+            )
+            if shutil.disk_usage(primary_dl_dir).free < missing_bytes + 2 * 1024**3:
+                raise RuntimeError(f"存储空间不足：还需约 {missing_bytes / 1024**3:.1f} GiB 权重空间，另需临时文件余量。")
 
         for idx, (fname, desc) in enumerate(req_files):
             touch_activity()
             target_file = os.path.join(primary_dl_dir, fname)
             existing = (
                 target_file if os.path.isfile(target_file) and not os.path.islink(target_file)
-                and os.path.getsize(target_file) > 64 * 1024
+                and _model_file_valid(target_id, target_file, fname)
                 else _find_existing_model_file(target_id, fname)
             )
-            base_prog = idx / float(total_files + 1)
-            MODEL_DOWNLOAD_STATE["progress"] = round(base_prog + 0.04, 2)
+            def report_bytes(completed, filename=fname):
+                transfer.record(filename, completed)
+                state = transfer.snapshot()
+                MODEL_DOWNLOAD_STATE["progress"] = state["download_completed_bytes"] / max(1, state["download_total_bytes"])
 
             if existing:
                 MODEL_DOWNLOAD_STATE["message"] = f"[{idx+1}/{total_files}] 正在确认或复制已有权重 {fname} 至 {primary_dl_dir}..."
                 print(MODEL_DOWNLOAD_STATE["message"])
-                _copy_model_file(existing, primary_dl_dir, fname)
+                _copy_model_file(existing, primary_dl_dir, fname, report_bytes)
                 size_gb = os.path.getsize(existing) / (1024 ** 3)
                 MODEL_DOWNLOAD_STATE["message"] = f"[{idx+1}/{total_files}] {fname} 已就绪 ({size_gb:.2f} GB)，跳过下载"
                 print(MODEL_DOWNLOAD_STATE["message"])
@@ -2181,9 +2277,14 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
                 dest_dir=primary_dl_dir,
                 hf_token=hf_token,
                 num_connections=8,
+                revision=spec.get("revision", "main"),
+                progress_callback=report_bytes,
             )
+            if not _model_file_valid(target_id, target_file, fname):
+                raise RuntimeError(f"权重文件大小校验失败: {fname}，请重新下载。")
+            report_bytes(os.path.getsize(target_file))
 
-        MODEL_DOWNLOAD_STATE["progress"] = 0.92
+        MODEL_DOWNLOAD_STATE["progress"] = 1.0
         if target_id == "qwen38_27b_gguf":
             MODEL_DOWNLOAD_STATE["message"] = "正在预装并校验 llama.cpp CUDA 高速推理引擎..."
             _ensure_llama_server_binary()
@@ -2195,6 +2296,23 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
             raise RuntimeError("Google Drive 挂载已断开，无法确认模型持久化完成。")
         if not _model_directory_ready(target_id, primary_dl_dir):
             raise RuntimeError("模型权重或配置未完整保存，请检查存储空间后重试。")
+        if DRIVE_MOUNTED:
+            MODEL_DOWNLOAD_STATE["message"] = "下载已完成，正在等待 Drive 后台上传及远端校验；不要释放实例。"
+            print(MODEL_DOWNLOAD_STATE["message"])
+            last_upload_log = [0.0]
+            def upload_heartbeat():
+                touch_activity()
+                state = transfer.snapshot()
+                MODEL_DOWNLOAD_STATE["progress"] = state["upload_confirmed_bytes"] / max(1, state["upload_total_bytes"])
+                MODEL_DOWNLOAD_STATE["message"] = (
+                    f"下载已完成；Drive 已确认 {state['upload_confirmed_bytes'] / 1024**3:.2f}/"
+                    f"{state['upload_total_bytes'] / 1024**3:.2f} GiB。{state['transfer_message']}"
+                )
+                if time.monotonic() - last_upload_log[0] >= 30:
+                    print(MODEL_DOWNLOAD_STATE["message"])
+                    last_upload_log[0] = time.monotonic()
+            if not transfer.finish(heartbeat=upload_heartbeat):
+                raise RuntimeError(transfer.snapshot()["transfer_message"])
         status = check_model_files_status(target_id)
         storage_message = (
             f"权重与配置已完整持久化至 Google Drive: {primary_dl_dir}，下次挂载后可直接复用。"
@@ -2207,6 +2325,14 @@ def download_model_weights_core(model_id: Optional[str] = None, hf_token: str = 
         return True, msg
 
     except Exception as e:
+        if transfer:
+            with transfer.lock:
+                transfer.upload_state = "error" if DRIVE_MOUNTED else "not_required"
+                if transfer.download_finished:
+                    transfer.message = "文件已下载，但 Drive 尚未确认持久化；请勿释放实例，检查授权/挂载后点击校验权重重试。"
+                else:
+                    transfer.message = "下载/复制未完成，已保留完整文件；请检查日志后重试。"
+            transfer.cancel()
         err_msg = f"下载 {spec['name']} 权重出错: {str(e)}"
         MODEL_DOWNLOAD_STATE["message"] = err_msg
         print(err_msg)
@@ -2873,6 +2999,12 @@ def load_model_to_vram_core(
     target_id = model_id if (model_id and model_id in MODEL_CATALOG) else SELECTED_MODEL_ID
     SELECTED_MODEL_ID = target_id
     spec = MODEL_CATALOG[target_id]
+    if spec.get("backend") == "vllm":
+        try:
+            easycolab_vllm.validate_hardware(torch)
+            easycolab_vllm.validate_context(ctx_len)
+        except (RuntimeError, ValueError) as hardware_error:
+            return False, str(hardware_error)
     file_status = check_model_files_status(target_id)
     auto_switched_notice = ""
 
@@ -2902,7 +3034,9 @@ def load_model_to_vram_core(
             vram_limit = max(8.0, total_vram_gb - 2.5)
 
             # 计算新模型所需最小空闲显存阈值：余量充足时自动与已加载模型共驻显存！
-            if target_id == "qwen38_27b":
+            if spec.get("backend") == "vllm":
+                required_free_gb = total_vram_gb * 0.9
+            elif target_id == "qwen38_27b":
                 required_free_gb = 53.0
             elif target_id == "deepseek_v4_pro_qwen35_9b_heretic":
                 required_free_gb = 20.5
@@ -2917,7 +3051,14 @@ def load_model_to_vram_core(
 
             if torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3) < required_free_gb and COMFYUI_STATE.get("is_running"):
                 free_comfyui_vram_core()
-            evicted_names = _ensure_vram_for_new_model_locked(target_id, required_free_gb)
+            if spec.get("backend") == "vllm":
+                evicted_names = _unload_model_locked("all")
+                free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+                if free_bytes < total_bytes * 0.9:
+                    raise RuntimeError("GPU 可用显存不足 90%，请先释放其他 GPU 任务再加载单卡 NVFP4。")
+                easycolab_vllm.validate_memory(_get_system_ram_gb()[1])
+            else:
+                evicted_names = _ensure_vram_for_new_model_locked(target_id, required_free_gb)
             free_before_gb = torch.cuda.mem_get_info("cuda")[0] / (1024 ** 3)
 
             vram_config = {
@@ -3100,6 +3241,25 @@ def load_model_to_vram_core(
                 )
                 _enable_high_vram_optimizations(new_pipe, total_vram_gb=total_vram_gb, preload_vram=True)
                 mode_label = "Z-Image-Turbo · 8步极速 BF16"
+
+            elif spec.get("backend") == "vllm":
+                if hf_token.strip():
+                    os.environ["HF_TOKEN"] = hf_token.strip()
+                model_dir = _get_model_dirs(target_id)[2 if DRIVE_MOUNTED else 1]
+                for filename, description in spec["files"]:
+                    existing = _find_existing_model_file(target_id, filename)
+                    if not existing:
+                        raise FileNotFoundError(f"模型权重缺失: {filename}")
+                    _copy_model_file(existing, model_dir, filename)
+                _ensure_model_metadata(target_id, model_dir)
+
+                def report_vllm(message):
+                    touch_activity()
+                    MODEL_DOWNLOAD_STATE["message"] = message
+                    print(message)
+
+                new_llm = easycolab_vllm.start_server(model_dir, ctx_len, report_vllm)
+                mode_label = new_llm["mode_label"]
 
             elif _is_llm_model_id(target_id) and target_id != "qwen38_27b_gguf":
                 minimum_free_gb = 49.0 if target_id == "qwen38_27b" else 20.0
@@ -4970,7 +5130,7 @@ def stop_comfyui_core(sync_before_stop: bool = True) -> Tuple[bool, str]:
                         pass
                 COMFYUI_STATE[key] = None
         subprocess.run(["pkill", "-f", "ComfyUI/main.py"], check=False)
-        subprocess.run(["pkill", "-f", "cloudflared.*8188"], check=False)
+        subprocess.run(["pkill", "-f", r"cloudflared.*--url http://127\.0\.0\.1:8188( |$)"], check=False)
         if os.path.exists(_COMFY_STATE_FILE):
             try:
                 os.remove(_COMFY_STATE_FILE)
@@ -5138,7 +5298,7 @@ def start_comfyui_core(unload_existing: bool = False, force_restart: bool = Fals
         COMFYUI_STATE["progress"] = 0.80
         COMFYUI_STATE["status_message"] = "正在拉起 ComfyUI 节点推理引擎 (端口 8188)..."
         subprocess.run(["pkill", "-f", "ComfyUI/main.py"], check=False)
-        subprocess.run(["pkill", "-f", "cloudflared.*8188"], check=False)
+        subprocess.run(["pkill", "-f", r"cloudflared.*--url http://127\.0\.0\.1:8188( |$)"], check=False)
         time.sleep(0.6)
 
         port = int(COMFYUI_STATE.get("local_port") or 8188)
@@ -5604,7 +5764,7 @@ def _split_thinking_and_answer(raw_text: str) -> Tuple[str, str]:
 def _is_bundle_alive(bundle: Optional[Dict[str, Any]]) -> bool:
     if not bundle:
         return False
-    if bundle.get("backend") == "gguf":
+    if bundle.get("backend") in ("gguf", "vllm"):
         proc = bundle.get("server_proc")
         return proc is not None and proc.poll() is None
     return bundle.get("model") is not None
@@ -5614,6 +5774,15 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
     candidates: List[str] = []
     if preferred_model_id:
         low = preferred_model_id.lower()
+        for model_id, spec in MODEL_CATALOG.items():
+            if spec.get("backend") == "vllm" and low in (model_id.lower(), spec["repo_id"].lower(), spec["name"].lower()):
+                exact_bundle = LOADED_RUNTIMES.get(model_id, {}).get("llm_bundle")
+                if _is_bundle_alive(exact_bundle):
+                    return exact_bundle
+                if exact_bundle:
+                    _stop_gguf_server_bundle(exact_bundle)
+                    LOADED_RUNTIMES.pop(model_id, None)
+                return None
         if _is_llm_model_id(preferred_model_id):
             candidates.append(preferred_model_id)
         elif "gguf" in low or "q4_k" in low or "unsloth" in low:
@@ -5639,7 +5808,8 @@ def _get_qwen_llm_bundle(preferred_model_id: Optional[str] = None) -> Optional[D
             if _is_bundle_alive(b):
                 return b
             # GGUF 子进程意外退出时清理陈旧表项
-            if b and b.get("backend") == "gguf":
+            if b and b.get("backend") in ("gguf", "vllm"):
+                _stop_gguf_server_bundle(b)
                 LOADED_RUNTIMES.pop(cid, None)
 
     if _is_bundle_alive(LLM_BUNDLE):
@@ -5651,12 +5821,16 @@ def _count_bundle_tokens(bundle: Optional[Dict[str, Any]], text: str) -> int:
     if not text:
         return 1
     if bundle is not None:
-        if bundle.get("backend") == "gguf":
+        if bundle.get("backend") in ("gguf", "vllm"):
             try:
                 opener = _make_noproxy_opener()
+                token_payload = (
+                    {"model": bundle["served_model"], "prompt": text}
+                    if bundle.get("backend") == "vllm" else {"content": text}
+                )
                 tok_req = urllib.request.Request(
                     f"{bundle['base_url']}/tokenize",
-                    data=json.dumps({"content": text}).encode("utf-8"),
+                    data=json.dumps(token_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -5688,7 +5862,7 @@ def _run_qwen_llm_job(job_id: str, req: GenerateVideoRequest, target_llm_id: Opt
         JOBS[job_id]["message"] = "Qwen3.8-27B 尚未加载至 GPU 显存！请先在左侧点击「加载到显存」。"
         return
 
-    model_label = "Qwen3.8-27B-GGUF" if bundle.get("backend") == "gguf" else "Qwen3.8-27B"
+    model_label = MODEL_CATALOG[bundle["model_id"]]["name"]
     first_img = decode_base64_image(req.first_frame_base64)
     last_img = decode_base64_image(req.last_frame_base64)
     attached_images = [im for im in (first_img, last_img) if im is not None]
@@ -6471,6 +6645,7 @@ def _normalize_to_hf_messages_and_images(
     raw_messages: List[Dict[str, Any]],
     system_prompt: Any = None,
     protocol: str = "openai",
+    preserve_tool_calls: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Image.Image]]:
     """将 OpenAI 或 Anthropic 消息数组统一转换为 Qwen3.8 Processor 标准多模态结构"""
     hf_messages: List[Dict[str, Any]] = []
@@ -6492,10 +6667,11 @@ def _normalize_to_hf_messages_and_images(
 
         if role == "tool":
             txt = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-            hf_messages.append({"role": "tool", "content": txt})
+            hf_messages.append({"role": "tool", "content": txt, "tool_call_id": msg.get("tool_call_id", "call_0")})
             continue
 
         blocks: List[Dict[str, Any]] = []
+        structured_calls = list(msg.get("tool_calls") or []) if preserve_tool_calls else []
         if isinstance(content, str):
             blocks.append({"type": "text", "text": content})
         elif isinstance(content, list):
@@ -6524,6 +6700,12 @@ def _normalize_to_hf_messages_and_images(
                         pil_images.append(im)
                         blocks.append({"type": "image", "image": im})
                 elif ptype == "tool_use":
+                    if preserve_tool_calls:
+                        structured_calls.append({
+                            "id": part.get("id", "call_0"), "type": "function",
+                            "function": {"name": part.get("name", ""), "arguments": json.dumps(part.get("input", {}), ensure_ascii=False)},
+                        })
+                        continue
                     tc_str = json.dumps({"name": part.get("name", ""), "arguments": part.get("input", {})}, ensure_ascii=False)
                     blocks.append({"type": "text", "text": f"<tool_call>\n{tc_str}\n</tool_call>"})
                 elif ptype == "tool_result":
@@ -6532,10 +6714,10 @@ def _normalize_to_hf_messages_and_images(
                         tr_txt = "\n".join(x.get("text", "") for x in tr_content if isinstance(x, dict))
                     else:
                         tr_txt = str(tr_content)
-                    hf_messages.append({"role": "tool", "content": tr_txt})
+                    hf_messages.append({"role": "tool", "content": tr_txt, "tool_call_id": part.get("tool_use_id", "call_0")})
 
         # OpenAI assistant historical tool_calls
-        if role == "assistant" and msg.get("tool_calls"):
+        if role == "assistant" and msg.get("tool_calls") and not preserve_tool_calls:
             for tc in msg["tool_calls"]:
                 fn = tc.get("function", {})
                 raw_a = fn.get("arguments", "{}")
@@ -6546,7 +6728,9 @@ def _normalize_to_hf_messages_and_images(
                 tc_json = json.dumps({"name": fn.get("name", ""), "arguments": a_obj}, ensure_ascii=False)
                 blocks.append({"type": "text", "text": f"<tool_call>\n{tc_json}\n</tool_call>"})
 
-        if blocks:
+        if structured_calls:
+            hf_messages.append({"role": role, "content": blocks, "tool_calls": structured_calls})
+        elif blocks:
             hf_messages.append({"role": role, "content": blocks})
 
     return hf_messages, pil_images
@@ -6638,6 +6822,11 @@ def _hf_messages_to_gguf_openai_messages(hf_messages: List[Dict[str, Any]]) -> T
     for msg in hf_messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
+        if role == "assistant" and msg.get("tool_calls"):
+            assistant_text = content if isinstance(content, str) else "".join(part.get("text", "") for part in content)
+            est_chars += len(assistant_text) + len(json.dumps(msg["tool_calls"]))
+            oai_msgs.append({"role": role, "content": assistant_text or None, "tool_calls": msg["tool_calls"]})
+            continue
         if role == "tool":
             s_txt = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
             est_chars += len(s_txt)
@@ -6687,7 +6876,9 @@ def _prepare_gguf_streamer_generation(
     repeat_penalty: float = 1.0,
     reasoning_effort: Optional[str] = None,
 ):
-    """通过驻留 GPU 的 llama-server 流式执行 Qwen3.8-27B-UD-Q4_K_M 推理 (遵循 Unsloth 官方 GGUF 部署参数规范，支持最高 256K 上下文与视觉输入)"""
+    """通过驻留 GPU 的 llama-server / vLLM OpenAI 接口统一流式推理。"""
+    is_vllm = bundle.get("backend") == "vllm"
+    backend_label = "vLLM" if is_vllm else "GGUF"
     oai_msgs, est_prompt_tokens = _hf_messages_to_gguf_openai_messages(hf_messages)
     bundle_ctx = int(bundle.get("context_length") or QWEN_CONTEXT_LENGTH)
     max_toks = max(16, min(65536, int(max_new_tokens or 16384), max(256, bundle_ctx - min(est_prompt_tokens, bundle_ctx - 256))))
@@ -6744,6 +6935,13 @@ def _prepare_gguf_streamer_generation(
     }
     if hf_tools:
         payload["tools"] = hf_tools
+    if is_vllm:
+        payload["model"] = bundle["served_model"]
+        payload.pop("samplers")
+        payload["repetition_penalty"] = payload.pop("repeat_penalty")
+        payload["top_k"] = eff_top_k_val or -1
+        if enable_thinking:
+            tpl_kwargs.setdefault("reasoning_effort", "medium")
 
     def _locked_gguf_generate():
         if cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set():
@@ -6758,7 +6956,7 @@ def _prepare_gguf_streamer_generation(
             srv_proc = bundle.get("server_proc")
             if srv_proc is not None and srv_proc.poll() is not None:
                 err_box[0] = RuntimeError(
-                    f"llama-server 子进程已意外退出 (code={srv_proc.returncode})，请在左侧重新点击「加载到显存」。"
+                    f"{backend_label} 子进程已意外退出 (code={srv_proc.returncode})，请在左侧重新点击「加载到显存」。"
                 )
                 streamer.end()
                 return
@@ -6808,6 +7006,8 @@ def _prepare_gguf_streamer_generation(
                         break
                     raw_line = resp.readline()
                     if not raw_line:
+                        if is_vllm and not (cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set()):
+                            raise RuntimeError("vLLM 响应流提前结束，未收到 [DONE]，请检查服务端日志。")
                         break
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data:"):
@@ -6840,7 +7040,7 @@ def _prepare_gguf_streamer_generation(
                         continue
                     delta = choices[0].get("delta") or {}
 
-                    r_txt = delta.get("reasoning_content")
+                    r_txt = delta.get("reasoning_content") or delta.get("reasoning")
                     if r_txt:
                         if not in_reasoning:
                             streamer.put_text("<think>\n" + str(r_txt), token_inc=1)
@@ -6892,12 +7092,16 @@ def _prepare_gguf_streamer_generation(
                 except Exception:
                     pass
                 if he.code == 400 and ("context" in err_body.lower() or "exceed" in err_body.lower()):
+                    context_tip = (
+                        "请缩短输入或减少输出 token；单卡 NVFP4 配置上限为 32K。"
+                        if is_vllm else "请在左侧调大「上下文长度」（最高 256K）后点击重新加载模型。"
+                    )
                     err_box[0] = RuntimeError(
-                        f"输入长度超出当前 GGUF 上下文窗口 ({bundle_ctx // 1024}K = {bundle_ctx} tokens)！"
-                        f"请在左侧调大「上下文长度」（最高 256K）后点击重新加载模型。({err_body[:180]})"
+                        f"输入长度超出当前 {backend_label} 上下文窗口 ({bundle_ctx // 1024}K = {bundle_ctx} tokens)！"
+                        f"{context_tip}({err_body[:180]})"
                     )
                 else:
-                    err_box[0] = RuntimeError(f"GGUF 推理服务返回 HTTP {he.code}: {err_body[:240]}")
+                    err_box[0] = RuntimeError(f"{backend_label} 推理服务返回 HTTP {he.code}: {err_body[:240]}")
             except Exception as ex:
                 if not (cancel_event.is_set() or ABORT_GENERATION_EVENT.is_set()):
                     err_box[0] = ex
@@ -6933,7 +7137,7 @@ def _prepare_qwen_streamer_generation(
 ):
     """构建 Qwen3.8 (GGUF 或 BF16 Transformers) 后台流式推理任务并返回 (streamer, prompt_tokens, start_in_thinking, gen_thread, err_box, cancel_event)"""
     bundle = _get_qwen_llm_bundle(preferred_model_id=preferred_model_id)
-    if bundle is not None and bundle.get("backend") == "gguf":
+    if bundle is not None and bundle.get("backend") in ("gguf", "vllm"):
         return _prepare_gguf_streamer_generation(
             bundle=bundle,
             hf_messages=hf_messages,
@@ -7078,6 +7282,15 @@ def attach_macos_api_routes(app: FastAPI):
     def api_status(model_id: Optional[str] = None):
         return get_gpu_status_dict(model_id=model_id)
 
+    @app.get("/minimax_api/processes")
+    def api_processes(request: Request):
+        if not API_AUTH_KEY:
+            return JSONResponse(status_code=403, content={"error": {"message": "Enable and sync the API key before opening process monitoring."}})
+        auth_error = _verify_external_api_auth(request)
+        if auth_error is not None:
+            return auth_error
+        return {"ok": True, **easycolab_monitor.MONITOR.details()}
+
     @app.post("/minimax_api/select_model")
     def api_select_model(req: SelectModelRequest):
         touch_activity()
@@ -7154,13 +7367,13 @@ def attach_macos_api_routes(app: FastAPI):
 
         body = await request.json()
         req_model = body.get("model") or "Qwen/Qwen3.8-27B"
-        bundle = _get_qwen_llm_bundle(preferred_model_id=str(req_model))
+        bundle = _get_qwen_llm_bundle(preferred_model_id=str(body.get("model") or ""))
         if bundle is None:
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": {
-                        "message": "Qwen3.8-27B / Qwen3.8-27B-GGUF 尚未加载至 Colab GPU 显存，请先在 Mac 客户端点击「加载到显存」。",
+                        "message": f"请求的模型 {req_model} 尚未加载，请先在客户端点击「加载到显存」。",
                         "type": "server_error",
                         "code": "model_not_loaded",
                     }
@@ -7194,7 +7407,9 @@ def attach_macos_api_routes(app: FastAPI):
 
         print(f"[OpenAI API] POST /v1/chat/completions | model={req_model} | backend={bundle.get('backend')} | stream={stream} | thinking={enable_thinking}")
 
-        hf_messages, pil_images = _normalize_to_hf_messages_and_images(body.get("messages", []), protocol="openai")
+        hf_messages, pil_images = _normalize_to_hf_messages_and_images(
+            body.get("messages", []), protocol="openai", preserve_tool_calls=bundle.get("backend") == "vllm",
+        )
         hf_tools = _normalize_hf_tools(body.get("tools"), protocol="openai")
 
         streamer, prompt_tokens, start_in_thinking, gen_thread, err_box, cancel_event = _prepare_qwen_streamer_generation(
@@ -7205,7 +7420,7 @@ def attach_macos_api_routes(app: FastAPI):
             max_new_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            preferred_model_id=str(req_model),
+            preferred_model_id=bundle["model_id"],
             top_k=top_k,
             min_p=min_p,
             presence_penalty=presence_penalty,
@@ -7216,7 +7431,7 @@ def attach_macos_api_routes(app: FastAPI):
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:20]}"
         created_ts = int(time.time())
 
-        if not stream:
+        def _openai_nonstream_response():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
             think_parts: List[str] = []
             text_parts: List[str] = []
@@ -7276,6 +7491,12 @@ def attach_macos_api_routes(app: FastAPI):
                     "total_tokens": final_prompt_tokens + comp_tokens,
                 },
             }
+
+        if not stream:
+            try:
+                return await asyncio.to_thread(_openai_nonstream_response)
+            finally:
+                cancel_event.set()
 
         def _openai_sse_stream():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
@@ -7449,7 +7670,7 @@ def attach_macos_api_routes(app: FastAPI):
 
         body = await request.json()
         req_model = body.get("model") or "Qwen/Qwen3.8-27B"
-        bundle = _get_qwen_llm_bundle(preferred_model_id=str(req_model))
+        bundle = _get_qwen_llm_bundle(preferred_model_id=str(body.get("model") or ""))
         if bundle is None:
             return JSONResponse(
                 status_code=503,
@@ -7457,7 +7678,7 @@ def attach_macos_api_routes(app: FastAPI):
                     "type": "error",
                     "error": {
                         "type": "overloaded_error",
-                        "message": "Qwen3.8-27B / Qwen3.8-27B-GGUF 尚未加载至 Colab GPU 显存，请先在 Mac 客户端点击「加载到显存」。",
+                        "message": f"请求的模型 {req_model} 尚未加载，请先在客户端点击「加载到显存」。",
                     },
                 },
             )
@@ -7482,6 +7703,7 @@ def attach_macos_api_routes(app: FastAPI):
             body.get("messages", []),
             system_prompt=body.get("system"),
             protocol="anthropic",
+            preserve_tool_calls=bundle.get("backend") == "vllm",
         )
         hf_tools = _normalize_hf_tools(body.get("tools"), protocol="anthropic")
 
@@ -7493,7 +7715,7 @@ def attach_macos_api_routes(app: FastAPI):
             max_new_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
-            preferred_model_id=str(req_model),
+            preferred_model_id=bundle["model_id"],
             top_k=top_k,
             min_p=0.0,
             presence_penalty=0.0 if enable_thinking else 1.5,
@@ -7502,7 +7724,7 @@ def attach_macos_api_routes(app: FastAPI):
 
         msg_id = f"msg_{uuid.uuid4().hex[:22]}"
 
-        if not stream:
+        def _anthropic_nonstream_response():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
             think_parts: List[str] = []
             text_parts: List[str] = []
@@ -7556,6 +7778,12 @@ def attach_macos_api_routes(app: FastAPI):
                 "stop_sequence": None,
                 "usage": {"input_tokens": final_prompt_tokens, "output_tokens": out_tokens},
             }
+
+        if not stream:
+            try:
+                return await asyncio.to_thread(_anthropic_nonstream_response)
+            finally:
+                cancel_event.set()
 
         def _anthropic_sse_event(ev_name: str, payload: Dict[str, Any]) -> str:
             return f"event: {ev_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
@@ -8427,19 +8655,33 @@ def create_ui() -> gr.Blocks:
 
 
 if __name__ == "__main__":
+    import signal
+
+    signal.signal(signal.SIGTERM, exit_on_sigterm)
+    public_tunnel = CloudflareTunnel()
     ui = create_ui()
     ui.queue()
-    app, local_url, share_url = ui.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=True,
-        inline=False,
-        prevent_thread_lock=True,
-        css=CUSTOM_CSS,
-    )
-    attach_macos_api_routes(app)
-    print("\n" + "=" * 72)
-    print("🍎 【macOS 原生 App 连接地址】请复制下方链接粘贴到 Mac 客户端：")
-    print(f"👉  {share_url or local_url}")
-    print("=" * 72 + "\n")
-    ui.block_thread()
+    try:
+        app, local_url, share_url = ui.launch(
+            server_name="0.0.0.0",
+            server_port=7860,
+            share=not bool(PUBLIC_TUNNEL_URL),
+            inline=False,
+            prevent_thread_lock=True,
+            css=CUSTOM_CSS,
+        )
+        attach_macos_api_routes(app)
+        if PUBLIC_TUNNEL_URL:
+            print("正在连接 Cloudflare 命名隧道 (connecting named tunnel)...", flush=True)
+            public_tunnel.start(_ensure_cloudflared_binary(), PUBLIC_TUNNEL_TOKEN)
+            PUBLIC_TUNNEL_TOKEN = ""
+        connection_url = PUBLIC_TUNNEL_URL or share_url or local_url
+        print("\n" + "=" * 72)
+        print("🍎 【桌面客户端 / WebUI 连接地址】请复制下方链接：")
+        print(f"👉  {connection_url}")
+        print("=" * 72 + "\n")
+        print(f"EASYCOLAB_READY_URL:{connection_url}", flush=True)
+        ui.block_thread()
+    finally:
+        public_tunnel.stop()
+        ui.close()

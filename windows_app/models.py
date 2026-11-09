@@ -780,6 +780,33 @@ OPEN_MODEL_CATALOG: List[OpenModelSpec] = [
         ],
     ),
     OpenModelSpec(
+        id="qwen38_flash_next_nvfp4",
+        name_zh="Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        name_en="Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        repo_id="orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        badge_zh="单卡 96GB · PLE→CPU · 171 GiB",
+        badge_en="Single 96GB GPU · PLE→CPU · 171 GiB",
+        summary_zh="需 HF 授权、Blackwell 96GB 与至少 112 GiB 可用系统内存；独立 vLLM、4K–32K 上下文，默认关闭 MTP",
+        summary_en="Requires HF access, Blackwell 96GB & 112 GiB free RAM; isolated vLLM, 4K–32K context, MTP off",
+        approx_size_gb=170.9,
+        icon="brain",
+        modality=ModelModality.LLM_VLM,
+        default_steps=20,
+        modes=[
+            TaskModeItem(id="chat", title_zh="深度推理对话", title_en="Reasoning Chat",
+                         subtitle_zh="NVFP4 专家驻留 GPU，PLE 表使用 CPU 内存", subtitle_en="NVFP4 experts on GPU, PLE table in host RAM", icon="bubble.left.and.bubble.right"),
+            TaskModeItem(id="vlm", title_zh="图像视觉理解", title_en="Vision Understanding",
+                         subtitle_zh="保留原始视觉塔，看图占用额外显存", subtitle_en="Original vision tower; images need extra VRAM", icon="eye"),
+            TaskModeItem(id="api", title_zh="API 协议网关", title_en="API Gateway",
+                         subtitle_zh="OpenAI / Anthropic 协议、工具调用与思考模式", subtitle_en="OpenAI / Anthropic protocols, tools & reasoning", icon="network"),
+        ],
+        default_files=[
+            ModelFileItem(name=f"model-{shard:05d}-of-00017.safetensors",
+                          desc=f"NVFP4 混合精度分片 {shard}/17", desc_en=f"NVFP4 mixed-precision shard {shard}/17")
+            for shard in range(1, 18)
+        ] + [ModelFileItem(name="model-mtp.safetensors", desc="MTP 权重（不默认启用投机解码）", desc_en="MTP weights (speculation off by default)")],
+    ),
+    OpenModelSpec(
         id="qwen_image_21",
         name_zh="Qwen-Image-2.1",
         name_en="Qwen-Image-2.1",
@@ -1181,9 +1208,7 @@ def format_uptime_hms(seconds: int) -> str:
 def mask_url_display(text: str, mask_enabled: bool) -> str:
     if not mask_enabled or not text:
         return text
-    out = re.sub(r"https?://[a-zA-Z0-9.-]+\.gradio\.live", "https://••••••••••••.gradio.live", text)
-    out = re.sub(r"https?://[a-zA-Z0-9.-]+\.trycloudflare\.com", "https://••••••••••••.trycloudflare.com", out)
-    return out
+    return re.sub(r"https?://[^\s/<>\"']+", "https://••••••••••••", text)
 
 
 def mask_email_display(email: str, mask_enabled: bool) -> str:

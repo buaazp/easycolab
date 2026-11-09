@@ -12,6 +12,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -22,6 +23,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from PySide6.QtCore import QObject, QTimer, Signal
+from windows_app.secure_credentials import (
+    delete_hf_token, delete_tunnel_token, load_hf_token, load_tunnel_token,
+    save_hf_token, save_tunnel_token,
+)
 
 from windows_app.models import (
     IMAGE_RESOLUTIONS,
@@ -84,11 +89,22 @@ class EasyColabViewModel(QObject):
         # ── Language Setting (Default MUST be Simplified Chinese "zh") ──
         self.language: str = "en" if str(self._settings.get("language", "zh")) == "en" else "zh"
         set_lang(self.language)
+        self._restore_hf_token()
 
         # ── Persisted Settings (Windows defaults to Light Mode) ──
         self.dark_mode: bool = bool(self._settings.get("darkMode", False))
         self.mask_server_url: bool = bool(self._settings.get("maskServerURL", False))
         self.colab_server_url: str = str(self._settings.get("colabServerURL", ""))
+        self.use_custom_domain: bool = bool(self._settings.get("useCustomDomain", False))
+        self.custom_domain_url: str = str(self._settings.get("customDomainURL", ""))
+        self.cloudflare_tunnel_token: str = ""
+        self.tunnel_credential_message: str = ""
+        try:
+            self.cloudflare_tunnel_token = load_tunnel_token()
+            if self.cloudflare_tunnel_token:
+                self.tunnel_credential_message = tr("已从 Windows 凭据管理器读取 Token", "Token restored from Windows Credential Manager")
+        except (OSError, UnicodeError):
+            self.tunnel_credential_message = tr("无法读取系统凭据，请重新填写 Token。", "Cannot read system credentials. Re-enter the token.")
         self.wake_gpu_choice: str = str(self._settings.get("wakeGPUChoiceV2", "G4"))
         if self.wake_gpu_choice not in {"G4", "H100", "A100", "L4", "T4"}:
             self.wake_gpu_choice = "G4"
@@ -112,7 +128,6 @@ class EasyColabViewModel(QObject):
         }
         self.has_seen_onboarding: bool = bool(self._settings.get("hasSeenOnboardingGuide_v1", False))
         self.combined_chart_mode: bool = bool(self._settings.get("combinedTelemetryChartMode", False))
-        self.hf_token: str = str(self._settings.get("hfToken", ""))
 
         # ── Account & Headless Colab Bridge State ──
         self.cli_logged_in: bool = False
@@ -128,6 +143,9 @@ class EasyColabViewModel(QObject):
         # ── Remote Runtime & Telemetry State ──
         self.is_connected: bool = False
         self.gpu_name: str = tr("尚未连接云端 GPU", "Cloud GPU Not Connected")
+        self.cpu_utilization_pct: Optional[float] = None
+        self.gpu_utilization_pct: Optional[float] = None
+        self._connection_warning: Optional[str] = None
         self.vram_used_gb: float = 0.0
         self.vram_total_gb: float = 0.0
         self.vram_free_gb: float = 0.0
@@ -174,6 +192,7 @@ class EasyColabViewModel(QObject):
         self.is_downloading_weights: bool = False
         self.is_loading_model: bool = False
         self.model_task_progress: float = 0.0
+        self.transfer_status: dict = {}
 
         self.loaded_model_ids: List[str] = []
         self.loaded_models_detail: List[LoadedModelSummary] = []
@@ -279,7 +298,15 @@ class EasyColabViewModel(QObject):
         return {}
 
     def _save_setting(self, key: str, value: Any) -> None:
+        if key == "hfToken":
+            raise ValueError("HF Token must use system credential storage")
         self._settings[key] = value
+        if "hfToken" in self._settings:
+            self.hf_credential_message = tr(
+                "HF Token 迁移未完成，暂缓保存设置以保留旧配置；请保存或清除 HF Token 后重试。",
+                "HF Token migration is pending; settings writes are paused to preserve the old file. Save or clear the token and retry.",
+            )
+            return
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
             self._config_path.write_text(
@@ -404,6 +431,129 @@ class EasyColabViewModel(QObject):
             self.wake_gpu_choice = gpu
             self._save_setting("wakeGPUChoiceV2", gpu)
             self.state_changed.emit()
+
+    def set_use_custom_domain(self, enabled: bool) -> None:
+        self.use_custom_domain = bool(enabled)
+        self._save_setting("useCustomDomain", self.use_custom_domain)
+        self.state_changed.emit()
+
+    def set_custom_domain_url(self, url: str) -> None:
+        self.custom_domain_url = url.strip()
+        self._save_setting("customDomainURL", self.custom_domain_url)
+
+    def set_cloudflare_tunnel_token(self, token: str) -> None:
+        self.cloudflare_tunnel_token = token
+        self.tunnel_credential_message = ""
+        self.state_changed.emit()
+
+    def save_tunnel_configuration(self) -> bool:
+        token = self.cloudflare_tunnel_token.strip()
+        if not self.custom_domain_url.strip() or not token:
+            self.tunnel_credential_message = tr("请填写 HTTPS 域名和 Tunnel Token。", "Enter an HTTPS domain and Tunnel Token.")
+            self.state_changed.emit()
+            return False
+        try:
+            save_tunnel_token(token)
+            self.cloudflare_tunnel_token = token
+            self.tunnel_credential_message = tr(
+                "Token 已保存至 Windows 凭据管理器，下次启动自动读取。",
+                "Token saved to Windows Credential Manager; restored on next launch.",
+            )
+            self.state_changed.emit()
+            return True
+        except (OSError, ValueError):
+            self.tunnel_credential_message = tr(
+                "Token 保存失败：请检查格式及系统凭据权限，未写入普通设置。",
+                "Token not saved. Check its format and credential permissions; no plaintext fallback.",
+            )
+            self.state_changed.emit()
+            return False
+
+    def clear_saved_tunnel_token(self) -> None:
+        try:
+            delete_tunnel_token()
+            self.cloudflare_tunnel_token = ""
+            self.tunnel_credential_message = tr("已删除本地 Token，域名配置保留。", "Local token deleted; domain settings kept.")
+        except OSError:
+            self.tunnel_credential_message = tr("Token 删除失败，请检查系统凭据权限。", "Token deletion failed. Check credential permissions.")
+        self.state_changed.emit()
+
+    def _remove_legacy_hf_token_setting(self) -> None:
+        if "hfToken" not in self._settings:
+            return
+        settings = {key: value for key, value in self._settings.items() if key != "hfToken"}
+        self._config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._config_path.parent, delete=False) as settings_file:
+                temporary_path = settings_file.name
+                json.dump(settings, settings_file, ensure_ascii=False, indent=2)
+            os.replace(temporary_path, self._config_path)
+            self._settings.pop("hfToken", None)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+    def _restore_hf_token(self) -> None:
+        legacy_token = str(self._settings.get("hfToken") or "").strip()
+        self.hf_token = legacy_token
+        self.hf_credential_message = ""
+        try:
+            if not legacy_token:
+                self._remove_legacy_hf_token_setting()
+            stored_token = load_hf_token()
+            self.hf_token = stored_token or legacy_token
+            if legacy_token and not stored_token:
+                save_hf_token(legacy_token)
+            self._remove_legacy_hf_token_setting()
+            if self.hf_token:
+                self.hf_credential_message = tr("HF Token 已从系统凭据恢复。", "HF Token restored from system credentials.")
+        except (OSError, ValueError):
+            if "hfToken" in self._settings:
+                self.hf_credential_message = tr(
+                    "HF Token 读取或旧配置迁移失败，旧配置未删除；请检查系统凭据权限后重新保存。",
+                    "HF Token restore or legacy migration failed; the old configuration is retained. Check credential permissions and save again.",
+                )
+            else:
+                self.hf_credential_message = tr("无法读取 HF Token，请检查系统凭据权限或重新填写。", "Cannot read HF Token. Check credential permissions or re-enter it.")
+
+    def set_hf_token(self, token: str) -> None:
+        self.hf_token = token
+        self.hf_credential_message = ""
+        self.state_changed.emit()
+
+    def save_hf_token(self) -> bool:
+        token = self.hf_token.strip()
+        if not token:
+            self.hf_credential_message = tr("请填写 HF Token；删除已保存凭据请点「清除」。", "Enter an HF Token; use Clear to delete saved credentials.")
+            self.state_changed.emit()
+            return False
+        try:
+            save_hf_token(token)
+        except (OSError, ValueError):
+            self.hf_credential_message = tr("HF Token 保存失败，请检查格式和系统凭据权限；未写入普通配置。", "HF Token not saved. Check its format and credential permissions; no plaintext fallback.")
+            self.state_changed.emit()
+            return False
+        self.hf_token = token
+        try:
+            self._remove_legacy_hf_token_setting()
+        except OSError:
+            self.hf_credential_message = tr("HF Token 已安全保存，但旧配置清理失败；请检查配置文件权限后重新保存。", "HF Token stored securely, but legacy cleanup failed. Check settings file permissions and save again.")
+            self.state_changed.emit()
+            return False
+        self.hf_credential_message = tr("HF Token 已保存至 Windows 凭据管理器，下次启动自动读取。", "HF Token saved to Windows Credential Manager; restored on next launch.")
+        self.state_changed.emit()
+        return True
+
+    def clear_saved_hf_token(self) -> None:
+        try:
+            self._remove_legacy_hf_token_setting()
+            delete_hf_token()
+            self.hf_token = ""
+            self.hf_credential_message = tr("已删除本地 HF Token，不影响 Tunnel Token；不会撤销 HF 网站上的令牌。", "Local HF Token deleted; Tunnel Token unchanged. The token is not revoked on Hugging Face.")
+        except OSError:
+            self.hf_credential_message = tr("HF Token 删除失败，请检查系统凭据及配置文件权限。", "HF Token deletion failed. Check credential and settings file permissions.")
+        self.state_changed.emit()
 
     def set_combined_chart_mode(self, combined: bool) -> None:
         self.combined_chart_mode = bool(combined)
@@ -886,6 +1036,13 @@ class EasyColabViewModel(QObject):
             self.state_changed.emit()
             return
 
+        if self.use_custom_domain and not self.save_tunnel_configuration():
+            self.status_message = self.tunnel_credential_message
+            self.state_changed.emit()
+            return
+        wake_env = self._bridge_env()
+        wake_env["EASYCOLAB_PUBLIC_URL"] = self.custom_domain_url if self.use_custom_domain else ""
+        wake_env["CLOUDFLARE_TUNNEL_TOKEN"] = self.cloudflare_tunnel_token if self.use_custom_domain else ""
         gpu = self.wake_gpu_choice
         self.is_waking_colab = True
         self.status_message = tr(
@@ -917,7 +1074,7 @@ class EasyColabViewModel(QObject):
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
-                    env=self._bridge_env(),
+                    env=wake_env,
                     creationflags=WIN_NO_WINDOW,
                 )
                 assert proc.stdout is not None
@@ -1114,6 +1271,9 @@ class EasyColabViewModel(QObject):
         self.drive_total_gb = 0.0
         self.drive_free_gb = 0.0
         self.drive_persisted = False
+        self.transfer_status = {}
+        self.cpu_utilization_pct = None
+        self.gpu_utilization_pct = None
         self.vram_history_pct.clear()
         self.ram_history_pct.clear()
         self.disk_history_pct.clear()
@@ -1131,6 +1291,7 @@ class EasyColabViewModel(QObject):
         self._remote_api_key_synced = False
         if message:
             self.status_message = strip_emoji(self.masked_url(message))
+            self._connection_warning = self.status_message
         self.state_changed.emit()
         self.telemetry_changed.emit()
 
@@ -1158,6 +1319,8 @@ class EasyColabViewModel(QObject):
     def _apply_live_telemetry_snapshot(self, tel: dict) -> None:
         if not isinstance(tel, dict):
             return
+        self.cpu_utilization_pct = tel.get("cpu_utilization_pct")
+        self.gpu_utilization_pct = tel.get("gpu_utilization_pct")
         if tel.get("gpu_name"):
             self.gpu_name = strip_emoji(str(tel["gpu_name"]))
         for attr, key in (
@@ -1184,7 +1347,11 @@ class EasyColabViewModel(QObject):
     def _apply_status_response(self, d: dict, update_status_msg: bool = False) -> None:
         self._consecutive_status_failures = 0
         was_connected = self.is_connected
+        task_was_busy = self.is_loading_model or self.is_downloading_weights
+        connection_warning = self._connection_warning
         self.is_connected = True
+        self.cpu_utilization_pct = d.get("cpu_utilization_pct")
+        self.gpu_utilization_pct = d.get("gpu_utilization_pct")
 
         if d.get("gpu_name"):
             self.gpu_name = strip_emoji(str(d["gpu_name"]))
@@ -1222,6 +1389,10 @@ class EasyColabViewModel(QObject):
             self.api_request_count = int(d["api_request_count"])
         if d.get("drive_persisted") is not None:
             self.drive_persisted = bool(d["drive_persisted"])
+        self.transfer_status = {key: d[key] for key in (
+            "download_completed_bytes", "download_total_bytes", "upload_completed_bytes", "upload_confirmed_bytes",
+            "upload_total_bytes", "upload_state", "upload_live", "transfer_message",
+        ) if key in d}
         if d.get("loaded_context_length") is not None:
             self.loaded_context_length = int(d["loaded_context_length"])
 
@@ -1291,12 +1462,13 @@ class EasyColabViewModel(QObject):
 
         if d.get("action_message"):
             self.status_message = localize_server_text(strip_emoji(self.masked_url(str(d["action_message"]))))
-        elif d.get("task_message") and (self.is_downloading_weights or self.is_loading_model):
+        elif d.get("task_message") and (self.is_downloading_weights or self.is_loading_model or task_was_busy):
             self.status_message = localize_server_text(strip_emoji(self.masked_url(str(d["task_message"]))))
         elif update_status_msg and d.get("message"):
             self.status_message = localize_server_text(strip_emoji(self.masked_url(str(d["message"]))))
-        elif not was_connected:
+        elif not was_connected or (connection_warning and self.status_message == connection_warning):
             self.status_message = tr(f"已连接云端 {self.gpu_name}！", f"Connected to cloud {self.gpu_name}!")
+        self._connection_warning = None
 
         # One-time per-connection remote config syncs
         if not self._remote_context_synced:
@@ -1425,6 +1597,8 @@ class EasyColabViewModel(QObject):
         self.state_changed.emit()
 
     def download_model_weights(self) -> None:
+        if self.hf_token.strip():
+            self.save_hf_token()
         base = self.normalized_base_url
         if not self.is_connected or not base:
             self.status_message = tr("请先连接或唤醒 Colab 云端实例。", "Please connect or wake a Colab cloud runtime first.")
@@ -1477,6 +1651,8 @@ class EasyColabViewModel(QObject):
         threading.Thread(target=worker, daemon=True).start()
 
     def load_model_to_vram(self) -> None:
+        if self.hf_token.strip():
+            self.save_hf_token()
         base = self.normalized_base_url
         if not self.is_connected or not base:
             self.status_message = tr("请先连接或唤醒 Colab 云端实例。", "Please connect or wake a Colab cloud runtime first.")
@@ -1501,7 +1677,7 @@ class EasyColabViewModel(QObject):
 
         payload = {
             "model_id": target_model,
-            "precision_mode": self.selected_precision,
+            "precision_mode": "nvfp4" if self.selected_model_id == "qwen38_flash_next_nvfp4" else self.selected_precision,
             "offload_mode": self.selected_offload,
             "context_length": self.context_length_tokens,
             "hf_token": self.hf_token.strip(),
@@ -2178,6 +2354,8 @@ class EasyColabViewModel(QObject):
         threading.Thread(target=worker, daemon=True).start()
 
     def download_comfy_weight(self, url_or_repo: str, filename: str, subfolder: str) -> None:
+        if self.hf_token.strip():
+            self.save_hf_token()
         src = (url_or_repo or "").strip()
         if not src:
             self.status_message = tr(
@@ -2246,6 +2424,8 @@ class EasyColabViewModel(QObject):
         threading.Thread(target=worker, daemon=True).start()
 
     def install_comfy_pack(self, pack_id: str, open_when_ready: bool = True) -> None:
+        if self.hf_token.strip():
+            self.save_hf_token()
         base = self.normalized_base_url
         if not self.is_connected or not base:
             self.status_message = tr(

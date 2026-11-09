@@ -314,7 +314,7 @@ def copy_app_sources_and_resources() -> None:
     step("5/6 Copying EasyColab application modules, icons & Colab server resources...")
     # Entry script & core resources in _internal/
     shutil.copy2(WIN_APP_DIR / "easycolab_win.py", INTERNAL_DIR / "easycolab_win.py")
-    for res_name in ("app.py", "colab_bridge.py", "EasyColab_Server.ipynb"):
+    for res_name in ("app.py", "colab_bridge.py", "easycolab_tunnel.py", "easycolab_vllm.py", "easycolab_transfer.py", "easycolab_drive.py", "easycolab_monitor.py", "EasyColab_Server.ipynb"):
         shutil.copy2(REPO_ROOT / res_name, INTERNAL_DIR / res_name)
 
     # Copy windows_app package

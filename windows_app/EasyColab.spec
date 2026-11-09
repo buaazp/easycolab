@@ -14,7 +14,7 @@ PROJECT_ROOT = SPEC_DIR.parent
 ICON_PATH = SPEC_DIR / "assets" / "AppIcon.ico"
 
 datas = []
-for res_name in ("app.py", "colab_bridge.py", "EasyColab_Server.ipynb", "requirements.txt"):
+for res_name in ("app.py", "colab_bridge.py", "easycolab_tunnel.py", "easycolab_vllm.py", "easycolab_transfer.py", "easycolab_drive.py", "easycolab_monitor.py", "EasyColab_Server.ipynb", "requirements.txt"):
     src = PROJECT_ROOT / res_name
     if src.exists():
         datas.append((str(src), "."))
@@ -36,6 +36,7 @@ for pkg in ("google-colab-cli", "google-auth", "google-auth-oauthlib", "requests
 
 hiddenimports = [
     "colab_bridge",
+    "easycolab_drive",
     "google.auth.transport.requests",
     "google.oauth2.credentials",
     "google_auth_oauthlib.flow",

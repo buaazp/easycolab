@@ -67,6 +67,7 @@ from windows_app.models import (
     tr,
 )
 from windows_app.onboarding_dialog import ColabGuideDialog
+from windows_app.desktop_tools import DriveConnectionDialog, ProcessMonitorDialog
 from windows_app.theme import (
     DARK_PALETTE,
     LIGHT_PALETTE,
@@ -386,6 +387,10 @@ class EasyColabMainWindow(QMainWindow):
         self.acc_menu_btn.setMenu(acc_menu)
         acc_row.addWidget(self.acc_menu_btn)
         card.body.addLayout(acc_row)
+        drive_button = QPushButton(tr("连接 Google Drive", "Connect Google Drive"))
+        drive_button.setToolTip(tr("通过浏览器授权，无需手工配置 rclone", "Authorize in your browser without manual rclone setup"))
+        drive_button.clicked.connect(lambda: DriveConnectionDialog(self.vm, self).exec())
+        card.body.addWidget(drive_button)
 
         # Row 1b: OAuth Code input (hidden by default)
         self.oauth_box = QWidget()
@@ -421,6 +426,45 @@ class EasyColabMainWindow(QMainWindow):
         self.wake_btn.clicked.connect(self.vm.wake_colab_headless)
         wk_lay.addWidget(self.wake_btn, 1)
         card.body.addWidget(self.wake_row_widget)
+
+        self.custom_domain_check = QCheckBox(tr("Cloudflare 自定义域名（唤醒部署）", "Cloudflare Custom Domain (Wake)"))
+        self.custom_domain_check.setChecked(self.vm.use_custom_domain)
+        self.custom_domain_check.toggled.connect(self.vm.set_use_custom_domain)
+        card.body.addWidget(self.custom_domain_check)
+        self.custom_domain_box = QWidget()
+        domain_layout = QVBoxLayout(self.custom_domain_box)
+        domain_layout.setContentsMargins(0, 0, 0, 0)
+        domain_layout.setSpacing(5)
+        self.custom_domain_input = QLineEdit(self.vm.custom_domain_url)
+        self.custom_domain_input.setPlaceholderText("https://ai.example.com")
+        self.custom_domain_input.setAccessibleName(tr("自定义 HTTPS 域名", "Custom HTTPS domain"))
+        self.custom_domain_input.textEdited.connect(self.vm.set_custom_domain_url)
+        domain_layout.addWidget(self.custom_domain_input)
+        self.tunnel_token_input = QLineEdit(self.vm.cloudflare_tunnel_token)
+        self.tunnel_token_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tunnel_token_input.setPlaceholderText("Tunnel Token")
+        self.tunnel_token_input.setAccessibleName("Cloudflare Tunnel Token")
+        self.tunnel_token_input.textEdited.connect(self.vm.set_cloudflare_tunnel_token)
+        self.tunnel_token_input.returnPressed.connect(self.vm.save_tunnel_configuration)
+        domain_layout.addWidget(self.tunnel_token_input)
+        credential_buttons = QHBoxLayout()
+        save_credential_btn = QPushButton(tr("保存配置", "Save Configuration"))
+        save_credential_btn.clicked.connect(self.vm.save_tunnel_configuration)
+        credential_buttons.addWidget(save_credential_btn)
+        clear_credential_btn = QPushButton(tr("清除 Token", "Clear Token"))
+        clear_credential_btn.clicked.connect(self.vm.clear_saved_tunnel_token)
+        credential_buttons.addWidget(clear_credential_btn)
+        domain_layout.addLayout(credential_buttons)
+        self.tunnel_credential_status = QLabel()
+        self.tunnel_credential_status.setWordWrap(True)
+        domain_layout.addWidget(self.tunnel_credential_status)
+        domain_hint = QLabel(tr(
+            "命名隧道指向 http://localhost:7860。保存配置或唤醒时将 Token 写入 Windows 凭据管理器，下次启动自动读取。固定域名不是鉴权，请在 Cloudflare 限制访问来源。",
+            "Route the named tunnel to http://localhost:7860. Save or wake stores the token in Windows Credential Manager for the next launch. A fixed URL is not authentication; restrict access in Cloudflare.",
+        ))
+        domain_hint.setWordWrap(True)
+        domain_layout.addWidget(domain_hint)
+        card.body.addWidget(self.custom_domain_box)
 
         # Row 3: Server URL + Privacy Eye + Connect + ?
         url_row = QHBoxLayout()
@@ -493,6 +537,14 @@ class EasyColabMainWindow(QMainWindow):
         self.chart_combined = CombinedTelemetryChartWidget()
         self.charts_stack.addWidget(self.chart_combined)
         card.body.addWidget(self.charts_stack)
+        utilization_row = QHBoxLayout()
+        self.cpu_util_button = QPushButton("CPU —")
+        self.gpu_util_button = QPushButton("GPU —")
+        for button, gpu_mode in ((self.cpu_util_button, False), (self.gpu_util_button, True)):
+            button.setToolTip(tr("点击查看只读进程监控，需启用并同步 API Key", "Open read-only process monitoring; enable and sync the API key"))
+            button.clicked.connect(lambda checked=False, gpu=gpu_mode: ProcessMonitorDialog(self.vm.normalized_base_url, self.vm.api_access_key, gpu, self).exec())
+            utilization_row.addWidget(button)
+        card.body.addLayout(utilization_row)
 
         # Footer for /dev/shm and Google Drive free space
         self.storage_footer_lbl = QLabel("")
@@ -629,9 +681,23 @@ class EasyColabMainWindow(QMainWindow):
         self.hf_token_input = QLineEdit(self.vm.hf_token)
         self.hf_token_input.setPlaceholderText(tr("可选 (下载受限仓库时填写)", "Optional (for gated HF repos)"))
         self.hf_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.hf_token_input.editingFinished.connect(self._on_hf_token_edited)
+        self.hf_token_input.textEdited.connect(self._on_hf_token_edited)
+        self.hf_token_input.returnPressed.connect(self.vm.save_hf_token)
         hf_row.addWidget(self.hf_token_input, 1)
+        hf_save_btn = QPushButton(tr("保存", "Save"))
+        hf_save_btn.setToolTip(tr("保存 HF Token 至 Windows 凭据管理器", "Save HF Token to Windows Credential Manager"))
+        hf_save_btn.clicked.connect(self.vm.save_hf_token)
+        hf_row.addWidget(hf_save_btn)
+        hf_clear_btn = QPushButton(tr("清除", "Clear"))
+        hf_clear_btn.setToolTip(tr("仅删除本地 HF Token", "Delete only the local HF Token"))
+        hf_clear_btn.clicked.connect(self.vm.clear_saved_hf_token)
+        hf_row.addWidget(hf_clear_btn)
         std_lay.addLayout(hf_row)
+        self.hf_credential_status = QLabel(self.vm.hf_credential_message)
+        self.hf_credential_status.setWordWrap(True)
+        self.hf_credential_status.setStyleSheet("font-size: 10px; color: #94A3B8;")
+        self.hf_credential_status.setVisible(bool(self.vm.hf_credential_message))
+        std_lay.addWidget(self.hf_credential_status)
 
         # KV context mismatch hint for Qwen GGUF
         self.kv_mismatch_lbl = QLabel("")
@@ -658,6 +724,19 @@ class EasyColabMainWindow(QMainWindow):
         self.weight_prog_bar.setRange(0, 100)
         self.weight_prog_bar.setVisible(False)
         std_lay.addWidget(self.weight_prog_bar)
+        self.transfer_box = QWidget()
+        transfer_layout = QVBoxLayout(self.transfer_box)
+        transfer_layout.setContentsMargins(0, 0, 0, 0)
+        self.download_bytes_label = QLabel()
+        self.download_bytes_progress = QProgressBar()
+        self.upload_bytes_label = QLabel()
+        self.upload_bytes_progress = QProgressBar()
+        self.upload_confirmation_label = QLabel()
+        self.upload_confirmation_label.setWordWrap(True)
+        for widget in (self.download_bytes_label, self.download_bytes_progress, self.upload_bytes_label, self.upload_bytes_progress, self.upload_confirmation_label):
+            transfer_layout.addWidget(widget)
+        self.transfer_box.setVisible(False)
+        std_lay.addWidget(self.transfer_box)
 
         # Download + Load VRAM + Eject buttons
         act_row = QHBoxLayout()
@@ -1874,6 +1953,8 @@ class EasyColabMainWindow(QMainWindow):
         st_lay.setContentsMargins(10, 8, 10, 8)
         st_lay.setSpacing(6)
         self.log_status_lbl = QLabel(self.vm.status_message)
+        self.log_status_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        self.log_status_lbl.setMaximumHeight(90)
         self.log_status_lbl.setWordWrap(True)
         self.log_status_lbl.setStyleSheet("font-size: 11.5px; line-height: 1.35;")
         st_lay.addWidget(self.log_status_lbl)
@@ -1881,6 +1962,9 @@ class EasyColabMainWindow(QMainWindow):
         self.log_task_prog.setRange(0, 100)
         self.log_task_prog.setVisible(False)
         st_lay.addWidget(self.log_task_prog)
+        status_details_button = QPushButton(tr("查看完整状态…", "Show Full Status…"))
+        status_details_button.clicked.connect(self._show_status_details)
+        st_lay.addWidget(status_details_button)
         bl.addWidget(st_box)
 
         # Theme-Aware Monospace Terminal
@@ -1945,9 +2029,18 @@ class EasyColabMainWindow(QMainWindow):
         if ans == QMessageBox.StandardButton.Yes:
             self.vm.disconnect_remote_colab()
 
+    def _show_status_details(self) -> None:
+        message = QMessageBox(self)
+        message.setWindowTitle(tr("完整运行状态", "Full Runtime Status"))
+        message.setTextFormat(Qt.TextFormat.PlainText)
+        text = self.vm.masked_url(self.vm.status_message)
+        message.setText(text[:500] + ("…" if len(text) > 500 else ""))
+        message.setDetailedText(text)
+        message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        message.exec()
+
     def _on_hf_token_edited(self) -> None:
-        self.vm.hf_token = self.hf_token_input.text().strip()
-        self.vm._save_setting("hfToken", self.vm.hf_token)
+        self.vm.set_hf_token(self.hf_token_input.text())
 
     def _on_offline_quick_action(self) -> None:
         if self.vm.cli_logged_in:
@@ -2174,6 +2267,20 @@ class EasyColabMainWindow(QMainWindow):
         self.wake_btn.setText(
             tr("唤醒部署中...", "Deploying...") if self.vm.is_waking_colab else tr("唤醒实例并部署", "Wake & Deploy")
         )
+        self.custom_domain_check.setEnabled(not self.vm.is_waking_colab)
+        self.custom_domain_box.setVisible(self.vm.use_custom_domain)
+        self.custom_domain_box.setEnabled(not self.vm.is_waking_colab)
+        self.tunnel_credential_status.setText(self.vm.tunnel_credential_message)
+        self.tunnel_credential_status.setVisible(bool(self.vm.tunnel_credential_message))
+        if not self.tunnel_token_input.hasFocus():
+            self.tunnel_token_input.setText(self.vm.cloudflare_tunnel_token)
+        self.hf_credential_status.setText(self.vm.hf_credential_message)
+        self.hf_credential_status.setVisible(bool(self.vm.hf_credential_message))
+        if not self.hf_token_input.hasFocus():
+            self.hf_token_input.setText(self.vm.hf_token)
+        self.custom_domain_input.setEchoMode(
+            QLineEdit.EchoMode.Password if self.vm.mask_server_url else QLineEdit.EchoMode.Normal
+        )
 
         if not self.url_input.hasFocus():
             self.url_input.setText(self.vm.colab_server_url)
@@ -2187,6 +2294,9 @@ class EasyColabMainWindow(QMainWindow):
 
         self.hw_gpu_lbl.setText(self.vm.gpu_name)
         self.drive_pill.setVisible(self.vm.drive_persisted)
+        for button, label, value in ((self.cpu_util_button, "CPU", self.vm.cpu_utilization_pct), (self.gpu_util_button, "GPU", self.vm.gpu_utilization_pct)):
+            button.setText(f"{label} {float(value):.1f}%" if value is not None else f"{label} —")
+            button.setEnabled(self.vm.is_connected)
 
         # 2. CU Ledger & Idle Timeout
         self.cu_title_lbl.setText(
@@ -2338,7 +2448,27 @@ class EasyColabMainWindow(QMainWindow):
             )
 
             busy_w = self.vm.is_downloading_weights or self.vm.is_loading_model
-            self.weight_prog_bar.setVisible(busy_w)
+            transfer = self.vm.transfer_status
+            total_bytes = max(0, float(transfer.get("download_total_bytes", 0)))
+            completed_bytes = max(0, float(transfer.get("download_completed_bytes", 0)))
+            upload_total = max(0, float(transfer.get("upload_total_bytes", 0)))
+            upload_sent = max(0, float(transfer.get("upload_completed_bytes", 0)))
+            upload_confirmed = max(0, float(transfer.get("upload_confirmed_bytes", 0)))
+            self.transfer_box.setVisible(total_bytes > 0)
+            self.download_bytes_label.setText(tr(f"下载/复用：{completed_bytes / 2**30:.2f} / {total_bytes / 2**30:.2f} GiB", f"Download / reuse: {completed_bytes / 2**30:.2f} / {total_bytes / 2**30:.2f} GiB"))
+            self.download_bytes_progress.setValue(min(100, int(completed_bytes / max(1, total_bytes) * 100)))
+            self.upload_bytes_label.setText(tr(f"Drive 已发送：{upload_sent / 2**30:.2f} / {upload_total / 2**30:.2f} GiB", f"Drive sent: {upload_sent / 2**30:.2f} / {upload_total / 2**30:.2f} GiB"))
+            if not transfer.get("upload_live"):
+                self.upload_bytes_label.setText(tr(f"Drive 已确认：{upload_confirmed / 2**30:.2f} / {upload_total / 2**30:.2f} GiB（不含进行中的分片）", f"Drive confirmed: {upload_confirmed / 2**30:.2f} / {upload_total / 2**30:.2f} GiB (excludes in-flight files)"))
+            self.upload_bytes_progress.setValue(min(100, int(upload_sent / max(1, upload_total) * 100)))
+            confirmation = tr("已持久化 · 远端校验通过", "Persisted · remote verification passed") if self.vm.drive_persisted else tr("尚未确认持久化 · 请勿释放实例", "Persistence unconfirmed · do not release runtime")
+            if transfer.get("upload_state") in {"error", "unavailable"}:
+                confirmation = tr("远端校验不可用或失败，请检查挂载/授权后重试。", "Remote verification unavailable or failed. Check mount/auth and retry.")
+            self.upload_confirmation_label.setText(tr(f"远端已确认：{upload_confirmed / 2**30:.2f} GiB\n发送 100% 不代表校验通过。{confirmation}", f"Remote confirmed: {upload_confirmed / 2**30:.2f} GiB\n100% sent is not verification. {confirmation}"))
+            self.upload_confirmation_label.setToolTip(str(transfer.get("transfer_message", "")))
+            for widget in (self.upload_bytes_label, self.upload_bytes_progress, self.upload_confirmation_label):
+                widget.setVisible(upload_total > 0)
+            self.weight_prog_bar.setVisible(self.vm.is_loading_model or (busy_w and total_bytes <= 0))
             self.weight_prog_bar.setValue(int(self.vm.model_task_progress * 100))
 
             self.dl_weights_btn.setText(
@@ -2479,7 +2609,8 @@ class EasyColabMainWindow(QMainWindow):
             )
 
         # 7. Right Log Panel Header & Status
-        self.log_status_lbl.setText(self.vm.status_message)
+        self.log_status_lbl.setText(self.vm.masked_url(self.vm.status_message))
+        self.log_status_lbl.setToolTip(self.vm.masked_url(self.vm.status_message))
         any_busy = (
             self.vm.is_generating
             or self.vm.is_downloading_weights
@@ -2959,6 +3090,9 @@ class EasyColabMainWindow(QMainWindow):
     # ─── Telemetry, Console, Chat & Local Gallery Refreshers ─────────────────
 
     def _refresh_telemetry(self) -> None:
+        for button, label, value in ((self.cpu_util_button, "CPU", self.vm.cpu_utilization_pct), (self.gpu_util_button, "GPU", self.vm.gpu_utilization_pct)):
+            button.setText(f"{label} {float(value):.1f}%" if value is not None else f"{label} —")
+            button.setEnabled(self.vm.is_connected)
         pal = self.palette_obj
         v_col = metric_threshold_color("vram", self.vm.vram_free_gb, pal.metric_vram)
         r_col = metric_threshold_color("ram", self.vm.ram_free_gb, pal.metric_ram)

@@ -15,6 +15,7 @@ dist/
 
 # Python Virtual Environments & Bytecode
 .venv/
+.easycolab-vllm-venv/
 .venv_win/
 venv/
 ENV/
@@ -29,6 +30,7 @@ __pycache__/
 *oauth*.json
 *credentials*.json
 pkce_verifier.txt
+.easycolab_tunnel.json
 
 # Local Generated Media & Temporary Outputs
 outputs/

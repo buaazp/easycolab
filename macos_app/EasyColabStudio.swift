@@ -483,6 +483,32 @@ let OPEN_MODEL_CATALOG: [OpenModelSpec] = [
         ]
     ),
     OpenModelSpec(
+        id: "qwen38_flash_next_nvfp4",
+        nameZh: "Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        nameEn: "Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        repoId: "orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4",
+        badgeZh: "单卡 96GB · PLE→CPU · 171 GiB",
+        badgeEn: "Single 96GB GPU · PLE→CPU · 171 GiB",
+        summaryZh: "需 HF 授权、Blackwell 96GB 与至少 112 GiB 可用系统内存；独立 vLLM、4K–32K 上下文，默认关闭 MTP",
+        summaryEn: "Requires HF access, Blackwell 96GB & 112 GiB free RAM; isolated vLLM, 4K–32K context, MTP off",
+        approxSizeGB: 170.9,
+        icon: "brain",
+        modality: .llmVLM,
+        defaultSteps: 20,
+        modes: [
+            TaskModeItem(id: "chat", titleZh: "深度推理对话", titleEn: "Reasoning Chat",
+                         subtitleZh: "NVFP4 专家驻留 GPU，PLE 表使用 CPU 内存", subtitleEn: "NVFP4 experts on GPU, PLE table in host RAM", icon: "bubble.left.and.bubble.right"),
+            TaskModeItem(id: "vlm", titleZh: "图像视觉理解", titleEn: "Vision Understanding",
+                         subtitleZh: "保留原始视觉塔，看图占用额外显存", subtitleEn: "Original vision tower; images need extra VRAM", icon: "eye"),
+            TaskModeItem(id: "api", titleZh: "API 协议网关", titleEn: "API Gateway",
+                         subtitleZh: "OpenAI / Anthropic 协议、工具调用与思考模式", subtitleEn: "OpenAI / Anthropic protocols, tools & reasoning", icon: "network")
+        ],
+        defaultFiles: (1...17).map { shard in
+            ModelFileItem(name: String(format: "model-%05d-of-00017.safetensors", shard),
+                          desc: "NVFP4 混合精度分片 \(shard)/17", exists: false, size_gb: 0)
+        } + [ModelFileItem(name: "model-mtp.safetensors", desc: "MTP 权重（不默认启用投机解码）", exists: false, size_gb: 0)]
+    ),
+    OpenModelSpec(
         id: "qwen_image_21",
         nameZh: "Qwen-Image-2.1",
         nameEn: "Qwen-Image-2.1",
@@ -709,6 +735,8 @@ struct ColabStatusResponse: Codable {
     var ok: Bool?
     var cuda_available: Bool?
     var gpu_name: String?
+    var cpu_utilization_pct: Double?
+    var gpu_utilization_pct: Double?
     var vram_free_gb: Double?
     var vram_total_gb: Double?
     var vram_used_gb: Double?
@@ -734,6 +762,14 @@ struct ColabStatusResponse: Codable {
     var is_loading_vram: Bool?
     var task_progress: Double?
     var task_message: String?
+    var download_completed_bytes: Double?
+    var download_total_bytes: Double?
+    var upload_completed_bytes: Double?
+    var upload_confirmed_bytes: Double?
+    var upload_total_bytes: Double?
+    var upload_state: String?
+    var upload_live: Bool?
+    var transfer_message: String?
 
     var uptime_seconds: Int?
     var cu_burn_rate_per_hour: Double?
@@ -940,6 +976,8 @@ struct CompletedMediaItem: Codable, Hashable {
 }
 
 struct LiveTelemetrySnapshot: Codable {
+    var cpu_utilization_pct: Double?
+    var gpu_utilization_pct: Double?
     var cuda_available: Bool?
     var gpu_name: String?
     var vram_free_gb: Double?
@@ -1201,6 +1239,12 @@ enum LocalRuntimePaths {
 @MainActor
 class StudioViewModel: ObservableObject {
     private var cachedBridgePythonBin: String? = nil
+    private let tunnelCredentialStore = TunnelCredentialStore()
+    private let hfCredentialStore = TunnelCredentialStore.huggingFace
+    private var statusSuccessVersion: UInt64 = 0
+    private var connectionWarning: String?
+    @Published var cpuUtilization: Double?
+    @Published var gpuUtilization: Double?
 
     var bridgeScript: String { LocalRuntimePaths.resolveBundledOrRepoFile("colab_bridge.py") }
     var appPyPath: String { LocalRuntimePaths.resolveBundledOrRepoFile("app.py") }
@@ -1212,18 +1256,34 @@ class StudioViewModel: ObservableObject {
     func maskedURLDisplay(_ rawURL: String) -> String {
         let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard maskServerURL, !trimmed.isEmpty else { return trimmed }
-        if let u = URL(string: trimmed), let scheme = u.scheme, let host = u.host {
-            let parts = host.split(separator: ".")
-            let suffix = parts.count >= 2 ? parts.suffix(2).joined(separator: ".") : host
-            return "\(scheme)://••••••••••••.\(suffix)"
+        if let url = URL(string: trimmed), let scheme = url.scheme, url.host != nil {
+            return "\(scheme)://••••••••••••"
         }
         return "https://••••••••••••"
+    }
+
+    func maskedConsoleDisplay(_ text: String) -> String {
+        guard maskServerURL else { return text }
+        return text.replacingOccurrences(of: #"https?://[^\s/<>\"']+"#, with: "https://••••••••••••", options: .regularExpression)
     }
 
     @Published var colabServerURL: String = UserDefaults.standard.string(forKey: "colabServerURL") ?? "" {
         didSet { UserDefaults.standard.set(colabServerURL, forKey: "colabServerURL") }
     }
-    @Published var hfToken: String = ""
+    @Published var hfToken: String = "" {
+        didSet { hfCredentialMessage = "" }
+    }
+    @Published var hfCredentialMessage: String = ""
+    @Published var useCustomDomain: Bool = UserDefaults.standard.bool(forKey: "useCustomDomain") {
+        didSet { UserDefaults.standard.set(useCustomDomain, forKey: "useCustomDomain") }
+    }
+    @Published var customDomainURL: String = UserDefaults.standard.string(forKey: "customDomainURL") ?? "" {
+        didSet { UserDefaults.standard.set(customDomainURL, forKey: "customDomainURL") }
+    }
+    @Published var cloudflareTunnelToken: String = "" {
+        didSet { tunnelCredentialMessage = "" }
+    }
+    @Published var tunnelCredentialMessage: String = ""
 
     // 默认初始文案（支持中英文双向无损切换）
     static let defaultGpuNameZh = "未连接 Colab 服务端"
@@ -1374,6 +1434,14 @@ class StudioViewModel: ObservableObject {
     @Published var comfyWeightSubfolder: String = "diffusion_models"
     @Published var comfyPullingOutputRelPath: String? = nil
     @Published var modelTaskProgress: Double = 0.0
+    @Published var downloadCompletedBytes: Double = 0
+    @Published var downloadTotalBytes: Double = 0
+    @Published var uploadCompletedBytes: Double = 0
+    @Published var uploadConfirmedBytes: Double = 0
+    @Published var uploadTotalBytes: Double = 0
+    @Published var uploadState: String = ""
+    @Published var uploadLive: Bool = false
+    @Published var transferMessage: String = ""
 
     @Published var selectedPrecision: String = "bf16"
     @Published var selectedOffload: String = "disk"
@@ -1594,6 +1662,8 @@ class StudioViewModel: ObservableObject {
     }
 
     private func applyLiveTelemetrySnapshot(_ snap: LiveTelemetrySnapshot) {
+        cpuUtilization = snap.cpu_utilization_pct
+        gpuUtilization = snap.gpu_utilization_pct
         if let g = snap.gpu_name, !g.isEmpty { gpuName = g }
         if let vf = snap.vram_free_gb { vramFreeGB = vf }
         if let vt = snap.vram_total_gb { vramTotalGB = vt }
@@ -1650,6 +1720,9 @@ class StudioViewModel: ObservableObject {
     }
 
     private func resetStaleRemoteRuntimeState(reason: String) {
+        connectionWarning = reason
+        cpuUtilization = nil
+        gpuUtilization = nil
         let hadActiveState = isConnected
             || !loadedModelsDetail.isEmpty
             || !loadedModelIds.isEmpty
@@ -1679,6 +1752,14 @@ class StudioViewModel: ObservableObject {
         comfyQueuePending = 0
         progressValue = 0.0
         modelTaskProgress = 0.0
+        downloadCompletedBytes = 0
+        downloadTotalBytes = 0
+        uploadCompletedBytes = 0
+        uploadConfirmedBytes = 0
+        uploadTotalBytes = 0
+        uploadState = ""
+        uploadLive = false
+        transferMessage = ""
         vramUsedGB = 0.0
         vramFreeGB = 0.0
         vramTotalGB = 0.0
@@ -1766,6 +1847,22 @@ class StudioViewModel: ObservableObject {
     }
 
     init() {
+        do {
+            hfToken = try hfCredentialStore.load()
+            if !hfToken.isEmpty {
+                hfCredentialMessage = L("HF Token 已从钥匙串恢复。", "HF Token restored from Keychain.")
+            }
+        } catch {
+            hfCredentialMessage = L("无法读取 HF Token，请解锁钥匙串或重新填写。", "Cannot read HF Token. Unlock Keychain or re-enter it.")
+        }
+        do {
+            cloudflareTunnelToken = try tunnelCredentialStore.load()
+            if !cloudflareTunnelToken.isEmpty {
+                tunnelCredentialMessage = L("已从钥匙串读取 Token", "Token restored from Keychain")
+            }
+        } catch {
+            tunnelCredentialMessage = L("无法读取钥匙串，请解锁或重新填写 Token。", "Cannot read Keychain. Unlock it or re-enter the token.")
+        }
         refreshLocalMedia()
         startBackgroundTelemetryLoop()
         languageObserver = NotificationCenter.default.addObserver(
@@ -2017,6 +2114,11 @@ class StudioViewModel: ObservableObject {
         }
     }
 
+    func runDriveCommand(_ controller: DriveConnectionController, arguments: [String]) async {
+        guard let python = await ensureBridgePythonBin(installIfMissing: true) else { return }
+        controller.run(python: python, script: bridgeScript, arguments: arguments)
+    }
+
     func refreshOfficialColabAccountUsage() async {
         let out = await runBridgeCommand(["auth_status"], installIfMissing: false)
         guard let data = out.data(using: .utf8),
@@ -2121,9 +2223,69 @@ class StudioViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func saveTunnelConfiguration() -> Bool {
+        let token = cloudflareTunnelToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !customDomainURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !token.isEmpty else {
+            tunnelCredentialMessage = L("请填写 HTTPS 域名和 Tunnel Token。", "Enter an HTTPS domain and Tunnel Token.")
+            return false
+        }
+        do {
+            try tunnelCredentialStore.save(token)
+            cloudflareTunnelToken = token
+            tunnelCredentialMessage = L("Token 已保存至本机钥匙串，下次启动自动读取。", "Token saved to this Mac's Keychain; restored on next launch.")
+            return true
+        } catch {
+            tunnelCredentialMessage = L("Token 保存失败：请检查格式及钥匙串权限，未写入普通设置。", "Token not saved. Check its format and Keychain permissions; no plaintext fallback.")
+            return false
+        }
+    }
+
+    func clearSavedTunnelToken() {
+        do {
+            try tunnelCredentialStore.delete()
+            cloudflareTunnelToken = ""
+            tunnelCredentialMessage = L("已删除本地 Token，域名配置保留。", "Local token deleted; domain settings kept.")
+        } catch {
+            tunnelCredentialMessage = L("Token 删除失败，请检查钥匙串权限。", "Token deletion failed. Check Keychain permissions.")
+        }
+    }
+
+    @discardableResult
+    func saveHFToken() -> Bool {
+        let token = hfToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            hfCredentialMessage = L("请填写 HF Token；删除已保存凭据请点「清除」。", "Enter an HF Token; use Clear to delete saved credentials.")
+            return false
+        }
+        do {
+            try hfCredentialStore.save(token)
+            hfToken = token
+            hfCredentialMessage = L("HF Token 已保存至本机钥匙串，下次启动自动读取。", "HF Token saved to this Mac's Keychain; restored on next launch.")
+            return true
+        } catch {
+            hfCredentialMessage = L("HF Token 保存失败，请检查格式和钥匙串权限；未写入普通配置。", "HF Token not saved. Check its format and Keychain permissions; no plaintext fallback.")
+            return false
+        }
+    }
+
+    func clearSavedHFToken() {
+        do {
+            try hfCredentialStore.delete()
+            hfToken = ""
+            hfCredentialMessage = L("已删除本地 HF Token，不影响 Tunnel Token；不会撤销 HF 网站上的令牌。", "Local HF Token deleted; Tunnel Token unchanged. The token is not revoked on Hugging Face.")
+        } catch {
+            hfCredentialMessage = L("HF Token 删除失败，请检查钥匙串权限。", "HF Token deletion failed. Check Keychain permissions.")
+        }
+    }
+
     func wakeColabHeadless() async {
         guard cliLoggedIn else {
             statusMessage = L("请先绑定 Google 账号后再使用免网页一键唤醒。", "Please bind your Google account before using headless 1-click wake.")
+            return
+        }
+        if useCustomDomain && !saveTunnelConfiguration() {
+            statusMessage = tunnelCredentialMessage
             return
         }
         isWakingColab = true
@@ -2143,12 +2305,17 @@ class StudioViewModel: ObservableObject {
         let script = self.bridgeScript
         let gpu = self.wakeGPUChoice
         let appPy = self.appPyPath
+        var wakeEnvironment = ProcessInfo.processInfo.environment
+        wakeEnvironment["EASYCOLAB_PUBLIC_URL"] = useCustomDomain ? customDomainURL : ""
+        wakeEnvironment["CLOUDFLARE_TUNNEL_TOKEN"] = useCustomDomain ? cloudflareTunnelToken : ""
+        let processEnvironment = wakeEnvironment
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: pyBin)
                 proc.arguments = [script, "wake", "--gpu", gpu, "--app-py", appPy]
+                proc.environment = processEnvironment
                 let pipe = Pipe()
                 proc.standardOutput = pipe
                 proc.standardError = pipe
@@ -2319,7 +2486,13 @@ class StudioViewModel: ObservableObject {
     }
 
     private func applyStatusResponse(_ decoded: ColabStatusResponse) {
+        let recovering = !isConnected && connectionWarning != nil && statusMessage == connectionWarning
+        let taskWasBusy = isLoadingModel || isDownloadingWeights
+        statusSuccessVersion &+= 1
+        consecutiveStatusFailures = 0
         isConnected = true
+        cpuUtilization = decoded.cpu_utilization_pct
+        gpuUtilization = decoded.gpu_utilization_pct
         gpuName = decoded.gpu_name ?? "Colab GPU"
         vramFreeGB = decoded.vram_free_gb ?? 0.0
         vramTotalGB = decoded.vram_total_gb ?? 0.0
@@ -2378,6 +2551,25 @@ class StudioViewModel: ObservableObject {
         isDownloadingWeights = decoded.is_downloading ?? false
         isLoadingModel = decoded.is_loading_vram ?? false
         if let p = decoded.task_progress { modelTaskProgress = p }
+        let taskEnded = taskWasBusy && !isLoadingModel && !isDownloadingWeights
+        if recovering || (connectionWarning != nil && statusMessage == connectionWarning) || taskEnded {
+            if let message = decoded.task_message, !message.isEmpty, taskWasBusy || isLoadingModel || isDownloadingWeights {
+                statusMessage = message
+            } else if !isGenerating {
+                statusMessage = modelLoaded
+                    ? L("连接已恢复 · 模型已就绪，可以开始对话或生成。", "Connection restored · model ready for chat or generation.")
+                    : L("已连接云端 · 状态已同步。", "Connected · cloud status synchronized.")
+            }
+        }
+        connectionWarning = nil
+        downloadCompletedBytes = decoded.download_completed_bytes ?? 0
+        downloadTotalBytes = decoded.download_total_bytes ?? 0
+        uploadCompletedBytes = decoded.upload_completed_bytes ?? 0
+        uploadConfirmedBytes = decoded.upload_confirmed_bytes ?? 0
+        uploadTotalBytes = decoded.upload_total_bytes ?? 0
+        uploadState = decoded.upload_state ?? ""
+        uploadLive = decoded.upload_live ?? false
+        transferMessage = decoded.transfer_message ?? ""
 
         uptimeSeconds = decoded.uptime_seconds ?? uptimeSeconds
         cuBurnRatePerHour = decoded.cu_burn_rate_per_hour ?? cuBurnRatePerHour
@@ -2560,6 +2752,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func startComfyWeightDownload() async {
+        if !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { saveHFToken() }
         let src = comfyWeightSourceInput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !src.isEmpty else {
             statusMessage = L(
@@ -2609,6 +2802,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func installComfyPresetPack(_ pack: ComfyPresetPackItem, openWhenReady: Bool = true) async {
+        if !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { saveHFToken() }
         let base = normalizedBaseURL
         guard isConnected, !base.isEmpty, let url = URL(string: "\(base)/minimax_api/comfyui/install_pack") else {
             statusMessage = L(
@@ -2767,6 +2961,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func checkColabStatus(silent: Bool = false) async {
+        let successVersion = statusSuccessVersion
         let base = normalizedBaseURL
         guard !base.isEmpty,
               let url = URL(string: "\(base)/minimax_api/status?model_id=\(selectedModelId)") else {
@@ -2790,7 +2985,9 @@ class StudioViewModel: ObservableObject {
             var req = URLRequest(url: url)
             req.timeoutInterval = isGenerating ? 28 : (silent ? 20 : 22)
             let (data, resp) = try await URLSession.shared.data(for: req)
+            guard base == normalizedBaseURL else { return }
             let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if statusCode != 200 && successVersion != statusSuccessVersion { return }
 
             if statusCode == 404 {
                 // 生成视频高负载期间单次 404 可能为 Gradio FRP 隧道瞬断，需连续多次确认才判定进程已停止
@@ -2826,7 +3023,9 @@ class StudioViewModel: ObservableObject {
             applyStatusResponse(decoded)
 
             if !silent {
-                if isSelectedModelLoadedInVRAM {
+                if (isLoadingModel || isDownloadingWeights), let message = decoded.task_message, !message.isEmpty {
+                    statusMessage = message
+                } else if isSelectedModelLoadedInVRAM {
                     statusMessage = L(
                         "已连接 \(gpuName) | \(activeModelSpec.name) 已驻留显存，可立即开始生成！",
                         "Connected to \(gpuName) | \(activeModelSpec.name) is in VRAM and ready to generate!"
@@ -2844,6 +3043,7 @@ class StudioViewModel: ObservableObject {
                 }
             }
         } catch {
+            guard successVersion == statusSuccessVersion, base == normalizedBaseURL else { return }
             consecutiveStatusFailures += 1
             let failureLimit = isGenerating ? 8 : 5
             if !silent {
@@ -2878,6 +3078,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func startRemoteDownloadWeights() async {
+        if !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { saveHFToken() }
         let base = normalizedBaseURL
         guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/download_model") else {
             statusMessage = L("请先连接有效的 Colab 服务端地址。", "Please connect to a valid Colab Server URL first.")
@@ -2927,6 +3128,7 @@ class StudioViewModel: ObservableObject {
     }
 
     func loadRemoteModelToVRAM() async {
+        if !hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { saveHFToken() }
         let base = normalizedBaseURL
         guard !base.isEmpty, let url = URL(string: "\(base)/minimax_api/load_model") else {
             statusMessage = L("请先填入有效的 Colab 服务端地址。", "Please enter a valid Colab Server URL first.")
@@ -2962,7 +3164,7 @@ class StudioViewModel: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = [
                 "model_id": targetModel,
-                "precision_mode": "bf16",
+                "precision_mode": targetModel == "qwen38_flash_next_nvfp4" ? "nvfp4" : "bf16",
                 "offload_mode": selectedOffload,
                 "context_length": contextLengthTokens,
                 "hf_token": hfToken
@@ -4808,6 +5010,11 @@ struct MainStudioView: View {
     @State private var openaiSnippetTab: Int = 0
     @State private var anthropicSnippetTab: Int = 0
     @State private var showRightLogPanel: Bool = true
+    @State private var showDriveConnection = false
+    @StateObject private var driveController = DriveConnectionController()
+    @State private var showProcessMonitor = false
+    @State private var monitorGPU = false
+    @State private var expandStatusMessage = false
 
     private var isTaskStreaming: Bool {
         vm.isWakingColab
@@ -4876,6 +5083,14 @@ struct MainStudioView: View {
         .background(TitlebarConfigurator(headerHeight: 40))
         .sheet(isPresented: $vm.showColabGuideSheet) {
             ColabGuideSheet(vm: vm)
+        }
+        .sheet(isPresented: $showDriveConnection) {
+            DriveConnectionView(controller: driveController, chinese: !i18n.isEN) { arguments in
+                Task { await vm.runDriveCommand(driveController, arguments: arguments) }
+            }
+        }
+        .sheet(isPresented: $showProcessMonitor) {
+            ProcessMonitorView(baseURL: vm.normalizedBaseURL, apiKey: vm.apiAccessKey, chinese: !i18n.isEN, gpuMode: monitorGPU)
         }
         .onAppear {
             if !UserDefaults.standard.bool(forKey: "hasSeenOnboardingGuide_v1") {
@@ -5098,7 +5313,7 @@ struct MainStudioView: View {
 
             Button {
                 copyToPasteboard(
-                    vm.liveConsoleLines.map(localizeConsoleLine).joined(separator: "\n"),
+                    vm.maskedConsoleDisplay(vm.liveConsoleLines.map(localizeConsoleLine).joined(separator: "\n")),
                     tip: L("已复制全部运行日志到剪贴板", "Copied all run logs to clipboard")
                 )
             } label: {
@@ -5213,6 +5428,13 @@ struct MainStudioView: View {
             }
         }
 
+        HStack {
+            Button(L("连接 Google Drive", "Connect Google Drive")) { showDriveConnection = true }
+                .controlSize(.small)
+                .help(L("浏览器授权 Drive，无需手工配置 rclone", "Authorize Drive in your browser without manual rclone setup"))
+            if driveController.authorized { Image(systemName: "checkmark.shield").foregroundStyle(.green) }
+        }
+
         if vm.showOAuthCodeInput {
             HStack(spacing: 6) {
                 TextField(
@@ -5270,6 +5492,43 @@ struct MainStudioView: View {
             }
         }
 
+        DisclosureGroup(L("Cloudflare 自定义域名", "Cloudflare Custom Domain")) {
+            VStack(alignment: .leading, spacing: 6) {
+                Toggle(L("唤醒时使用固定域名", "Use fixed domain on wake"), isOn: $vm.useCustomDomain)
+                if vm.useCustomDomain {
+                    Group {
+                        if vm.maskServerURL {
+                            SecureField(L("HTTPS 域名", "HTTPS domain"), text: $vm.customDomainURL)
+                        } else {
+                            TextField("https://ai.example.com", text: $vm.customDomainURL)
+                        }
+                    }
+                    .accessibilityLabel(L("自定义 HTTPS 域名", "Custom HTTPS domain"))
+                    SecureField("Tunnel Token", text: $vm.cloudflareTunnelToken)
+                        .onSubmit { vm.saveTunnelConfiguration() }
+                    HStack {
+                        Button(L("保存配置", "Save Configuration")) { vm.saveTunnelConfiguration() }
+                        Button(L("清除 Token", "Clear Token")) { vm.clearSavedTunnelToken() }
+                    }
+                    if !vm.tunnelCredentialMessage.isEmpty {
+                        Text(vm.tunnelCredentialMessage)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(L(
+                        "命名隧道指向 http://localhost:7860。保存配置或唤醒时将 Token 写入本机钥匙串，下次启动自动读取。",
+                        "Route the named tunnel to http://localhost:7860. Save or wake stores the token in Keychain for the next launch."
+                    ))
+                    Text(L("固定地址不是访问鉴权，请在 Cloudflare 限制访问来源。", "A fixed URL is not authentication. Restrict access in Cloudflare."))
+                        .foregroundStyle(.orange)
+                }
+            }
+            .font(.caption)
+            .textFieldStyle(.roundedBorder)
+            .disabled(vm.isWakingColab)
+            .padding(.top, 4)
+        }
+        .font(.caption)
+
         HStack(spacing: 6) {
             Group {
                 if vm.maskServerURL {
@@ -5282,7 +5541,7 @@ struct MainStudioView: View {
                     TextField(
                         L("服务地址", "Server URL"),
                         text: $vm.colabServerURL,
-                        prompt: Text("https://xxxx.gradio.live")
+                        prompt: Text("https://ai.example.com / xxxx.gradio.live")
                     )
                 }
             }
@@ -5353,6 +5612,11 @@ struct MainStudioView: View {
                           ? L("切换为显存/内存/硬盘独立折线面积图", "Switch to separate VRAM / RAM / Disk area charts")
                           : L("切换为显存/内存/硬盘三线同屏对比图", "Switch to combined 3-line telemetry comparison chart"))
                 }
+            }
+
+            HStack(spacing: 8) {
+                utilizationButton(title: "CPU", value: vm.cpuUtilization, gpu: false)
+                utilizationButton(title: "GPU", value: vm.gpuUtilization, gpu: true)
             }
 
             if vm.vramTotalGB > 0 || vm.ramTotalGB > 0 || vm.diskTotalGB > 0 {
@@ -5797,6 +6061,20 @@ struct MainStudioView: View {
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.small)
                             .font(.system(size: 11, design: .monospaced))
+                            .onSubmit { vm.saveHFToken() }
+                            Button(L("保存", "Save")) { vm.saveHFToken() }
+                                .controlSize(.small)
+                                .disabled(vm.hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                .help(L("保存 HF Token 至本机钥匙串", "Save HF Token to this Mac's Keychain"))
+                            Button(L("清除", "Clear")) { vm.clearSavedHFToken() }
+                                .controlSize(.small)
+                                .help(L("仅删除本地 HF Token", "Delete only the local HF Token"))
+                        }
+                        if !vm.hfCredentialMessage.isEmpty {
+                            Text(vm.hfCredentialMessage)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
@@ -5878,7 +6156,30 @@ struct MainStudioView: View {
                     .background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.10)))
                 }
 
-                if vm.isDownloadingWeights || vm.isLoadingModel {
+                if vm.downloadTotalBytes > 0 {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(String(format: L("下载/复用：%.2f / %.2f GiB", "Download / reuse: %.2f / %.2f GiB"), vm.downloadCompletedBytes / 1073741824, vm.downloadTotalBytes / 1073741824))
+                        ProgressView(value: min(1, max(0, vm.downloadCompletedBytes / vm.downloadTotalBytes)))
+                        if vm.uploadTotalBytes > 0 {
+                            Text(String(format: vm.uploadLive ? L("Drive 已发送：%.2f / %.2f GiB", "Drive sent: %.2f / %.2f GiB") : L("Drive 已确认：%.2f / %.2f GiB", "Drive confirmed: %.2f / %.2f GiB"), vm.uploadCompletedBytes / 1073741824, vm.uploadTotalBytes / 1073741824))
+                            ProgressView(value: min(1, max(0, vm.uploadCompletedBytes / vm.uploadTotalBytes)))
+                                .tint(vm.drivePersisted ? .green : .orange)
+                            Text(String(format: L("远端已确认：%.2f GiB（发送 100%% 不代表校验通过）", "Remote confirmed: %.2f GiB (100%% sent is not verification)"), vm.uploadConfirmedBytes / 1073741824))
+                            if !vm.uploadLive {
+                                Text(L("旧挂载：只计已上传完整文件，不含进行中的分片。", "Legacy mount: completed uploads only, excluding in-flight bytes."))
+                            }
+                            Text(vm.drivePersisted ? L("已持久化 · 远端校验通过", "Persisted · remote verification passed") : L("尚未确认持久化 · 请勿释放实例", "Persistence unconfirmed · do not release runtime"))
+                                .foregroundStyle(vm.drivePersisted ? Color.green : Color.orange)
+                            if vm.uploadState == "unavailable" || vm.uploadState == "error" {
+                                Text(L("远端校验不可用或失败，检查挂载/授权后点「校验权重」重试。", "Remote verification unavailable or failed. Check mount/auth, then retry Verify Weights."))
+                            }
+                        }
+                    }
+                    .font(.system(size: 10))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(vm.transferMessage)
+                }
+                if vm.isLoadingModel || (vm.isDownloadingWeights && vm.downloadTotalBytes <= 0) {
                     ProgressView(value: vm.modelTaskProgress, total: 1.0)
                 }
 
@@ -8112,11 +8413,25 @@ struct MainStudioView: View {
                     .padding(.top, 1)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(vm.displayStatusMessage)
-                        .font(.system(size: 11.5, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Group {
+                        if expandStatusMessage {
+                            ScrollView {
+                                Text(vm.displayStatusMessage)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }.frame(maxHeight: 220)
+                        } else {
+                            Text(vm.displayStatusMessage)
+                                .lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .help(vm.displayStatusMessage)
+                    Button(expandStatusMessage ? L("收起详情", "Collapse") : L("展开全部", "Show Full Message")) {
+                        expandStatusMessage.toggle()
+                    }.buttonStyle(.borderless).font(.caption)
 
                     if vm.isDownloadingWeights || vm.isLoadingModel {
                         ProgressView(value: vm.modelTaskProgress)
@@ -8146,7 +8461,7 @@ struct MainStudioView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 5) {
                         ForEach(Array(vm.liveConsoleLines.enumerated()), id: \.offset) { idx, line in
-                            let renderedLine = localizeConsoleLine(line)
+                            let renderedLine = vm.maskedConsoleDisplay(localizeConsoleLine(line))
                             Text(renderedLine)
                                 .font(.system(size: 11.5, design: .monospaced))
                                 .foregroundStyle(logLineColor(renderedLine))
@@ -8182,6 +8497,24 @@ struct MainStudioView: View {
             }
         }
         .padding(12)
+    }
+
+    private func utilizationButton(title: String, value: Double?, gpu: Bool) -> some View {
+        Button {
+            monitorGPU = gpu
+            showProcessMonitor = true
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title).font(.caption.weight(.semibold))
+                    Spacer()
+                    Text(value.map { String(format: "%.1f%%", $0) } ?? "—").monospacedDigit().font(.caption)
+                }
+                ProgressView(value: (value ?? 0) / 100)
+            }.padding(8).background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.045)))
+        }
+        .buttonStyle(.plain).disabled(!vm.isConnected)
+        .help(L("点击查看云端进程监控；需启用并同步 API Key。— 表示暂不可用，不是 0%。", "Open cloud process monitoring; enable and sync the API key. — means unavailable, not 0%."))
     }
 }
 

@@ -6,7 +6,7 @@ Supports:
   - auth_status : Check OAuth login state, real CU balance, hourly burn rate, and active VMs
   - auth_url    : Generate Google OAuth2 authorization URL for 1-click browser login
   - auth_code   : Exchange Google authorization code and save ~/.config/colab-cli/token.json
-  - wake        : Provision/reuse Colab GPU VM (G4/H100/A100/L4/T4), deploy app.py, and return gradio.live URL
+  - wake        : Provision/reuse Colab GPU VM, deploy the server, and return its public URL
   - keepalive   : Refresh Colab runtime proxy & kernel activity while active
   - stop_all    : Unassign and terminate all active Colab VMs on the account (verify 0 CU/hr burn)
 """
@@ -19,6 +19,7 @@ import uuid
 import argparse
 import urllib.request
 from importlib import resources
+from easycolab_tunnel import read_tunnel_config
 
 import requests
 from google.auth.transport.requests import Request
@@ -246,10 +247,66 @@ def cmd_auth_status():
 
 def _build_rclone_drive_conf() -> str:
     """
-    复用本地已授权的 Google Colab CLI OAuth 凭据 (含 drive.file 权限域)，
+    优先读取独立 Drive 授权配置，否则复用 Google Colab CLI OAuth 凭据 (含 drive.file 权限域)，
     生成云端 rclone Google Drive 配置，使无浏览器唤醒的 G4 实例也能自动挂载/同步 Google Drive，
     持久化保存 ComfyUI 自定义节点、模型与工作流。
     """
+    dedicated_path = os.environ.get("EASYCOLAB_RCLONE_CONFIG", "").strip()
+    drive_config_path = os.path.expanduser(dedicated_path or "~/.config/easycolab/drive-rclone.conf")
+    if dedicated_path or os.path.isfile(drive_config_path):
+        import configparser
+        import io
+
+        def config_failure(reason):
+            raise RuntimeError(f"独立 Drive 配置不可用：{reason} 不会回退使用 Colab OAuth 凭据。") from None
+
+        try:
+            with open(drive_config_path, encoding="utf-8-sig") as stream:
+                config_text = stream.read()
+        except FileNotFoundError:
+            config_failure("找不到配置文件，请检查 EASYCOLAB_RCLONE_CONFIG 或 ~/.config/easycolab/drive-rclone.conf。")
+        except (OSError, UnicodeError):
+            config_failure("无法读取配置文件，请检查权限及 UTF-8 编码。")
+        if any(line.strip().startswith("RCLONE_ENCRYPT_V") for line in config_text.splitlines()):
+            config_failure("配置文件已加密，请用 rclone 为 EasyColab 单独创建未加密且仅本用户可读的配置。")
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            config.read_string(config_text)
+        except configparser.Error:
+            config_failure("不是有效的 rclone INI 配置；请通过 rclone config 保存，不要粘贴授权网页或 JSON 客户端文件。")
+        if config.has_section("easycolab_gdrive"):
+            section = config["easycolab_gdrive"]
+            if section.get("type") != "drive":
+                config_failure("easycolab_gdrive 的类型必须为 drive。")
+        else:
+            drive_remotes = [name for name in config.sections() if config[name].get("type") == "drive"]
+            if not drive_remotes:
+                config_failure("未找到 Google Drive remote，请在 rclone config 中创建 Google Drive 类型的 remote。")
+            if len(drive_remotes) > 1:
+                config_failure("发现多个 Drive remote，请将要使用的一个命名为 easycolab_gdrive，避免连接错误的云盘。")
+            section = config[drive_remotes[0]]
+        try:
+            token_data = json.loads(section.get("token") or "{}")
+        except ValueError:
+            config_failure("token 授权数据不是有效 JSON，请用 rclone config reconnect 重新授权该 remote，不要手填 Token。")
+        if not isinstance(token_data, dict) or not isinstance(token_data.get("refresh_token", ""), str):
+            config_failure("token 授权数据格式错误，请用 rclone config reconnect 重新授权该 remote。")
+        if not token_data.get("refresh_token", "").strip():
+            config_failure(
+                "Google Drive 授权尚未完成，缺少 refresh_token；仅填写 Client ID / Secret 不算授权成功。"
+                "个人自用可在 Google Auth Platform「目标对象」保持「测试」并添加自己的账号为测试用户，"
+                "无需先通过品牌验证，再用 rclone config reconnect --config <配置文件> \"<remote 名称>:\" 完成浏览器授权。"
+                "测试授权约 7 天到期，届时需重新授权。"
+            )
+        selected_config = configparser.ConfigParser(interpolation=None)
+        selected_config["easycolab_gdrive"] = {
+            key: section[key] for key in ("type", "client_id", "client_secret", "scope", "token", "root_folder_id", "team_drive")
+            if key in section
+        }
+        output = io.StringIO()
+        selected_config.write(output)
+        return output.getvalue()
+
     if not os.path.exists(TOKEN_CONFIG_PATH):
         return ""
     try:
@@ -430,19 +487,48 @@ def _allocate_fresh_session(session_name: str, gpu_type: str) -> SessionState:
     return s
 
 
+def _upload_tunnel_config(contents, public_url, tunnel_token):
+    import tempfile
+
+    tunnel_fd, tunnel_path = tempfile.mkstemp(prefix="easycolab_tunnel_", suffix=".json")
+    try:
+        with os.fdopen(tunnel_fd, "w", encoding="utf-8") as tunnel_file:
+            json.dump({"EASYCOLAB_PUBLIC_URL": public_url, "CLOUDFLARE_TUNNEL_TOKEN": tunnel_token}, tunnel_file)
+        contents.upload(tunnel_path, "content/.easycolab_tunnel.json")
+    except Exception:
+        raise RuntimeError("无法上传隧道配置 (failed to upload tunnel configuration)") from None
+    finally:
+        os.remove(tunnel_path)
+
+
 def cmd_wake(gpu_type: str, app_py_path: str):
     """
     无浏览器一键唤醒 Colab GPU 并自动部署 EasyColab 多模型服务端：
     1. 幂等检查：若已有运行中的会话且探活成功则直接复用，否则自动清理失效会话并分配新实例
     2. 等待容器 Jupyter 端点 (/api/kernels) TLS/HTTP 握手就绪，规避 SSLEOFError
-    3. 上传本地最新 app.py 到 /content/app.py
-    4. 在远端内核安装依赖并后台拉起 app.py，提取 https://xxxx.gradio.live 隧道链接返回给 Mac 客户端
+    3. 上传本地最新 app.py、easycolab_tunnel.py 和临时隧道配置
+    4. 在远端内核安装依赖并后台拉起 app.py，提取就绪的自定义域名或 gradio.live 地址
     """
+    try:
+        public_url, tunnel_token = read_tunnel_config(os.environ)
+    except ValueError as config_error:
+        print(f"WAKE_ERROR: {config_error}", flush=True)
+        return
+
     if not _has_valid_token():
         print("WAKE_ERROR: 尚未授权登录 Google 账号，请先点击「🔑 绑定账号」", flush=True)
         return
 
+    tunnel_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_tunnel.py")
+    vllm_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_vllm.py")
+    transfer_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_transfer.py")
+    monitor_module_path = os.path.join(os.path.dirname(os.path.abspath(app_py_path)), "easycolab_monitor.py")
+    if not all(os.path.isfile(path) for path in (app_py_path, tunnel_module_path, vllm_module_path, transfer_module_path, monitor_module_path)):
+        print("WAKE_ERROR: 缺少服务端 Python 资源，请重新编译或更新客户端 (missing server resources)", flush=True)
+        return
+
     try:
+        rclone_conf_text = _build_rclone_drive_conf()
         session_name = "easycolab"
         print("WAKE_LOG: 🔍 正在检查账号下已有的 Colab 实例...", flush=True)
         local_sessions, assignments = _safe_sync_sessions()
@@ -505,6 +591,10 @@ def cmd_wake(gpu_type: str, app_py_path: str):
 
         print("WAKE_LOG: 正在上传最新多模型开源服务端代码 (app.py)...", flush=True)
         contents = ContentsClient(target_session)
+        contents.upload(tunnel_module_path, "content/easycolab_tunnel.py")
+        contents.upload(vllm_module_path, "content/easycolab_vllm.py")
+        contents.upload(transfer_module_path, "content/easycolab_transfer.py")
+        contents.upload(monitor_module_path, "content/easycolab_monitor.py")
         for up_attempt in range(4):
             try:
                 contents.upload(app_py_path, "content/app.py")
@@ -514,7 +604,6 @@ def cmd_wake(gpu_type: str, app_py_path: str):
                     raise up_err
                 time.sleep(2.5)
 
-        rclone_conf_text = _build_rclone_drive_conf()
         if rclone_conf_text:
             import tempfile
             tmp_rc_fd, tmp_rc_path = tempfile.mkstemp(prefix="easycolab_rc_", suffix=".conf")
@@ -524,17 +613,37 @@ def cmd_wake(gpu_type: str, app_py_path: str):
                 os.chmod(tmp_rc_path, 0o600)
                 contents.upload(tmp_rc_path, "content/.easycolab_rclone.conf")
             except Exception:
-                pass
+                raise RuntimeError("上传 Drive 挂载凭据失败，请检查连接后重试；不会继续以临时磁盘部署。") from None
             finally:
                 if os.path.exists(tmp_rc_path):
                     try:
                         os.remove(tmp_rc_path)
                     except Exception:
                         pass
+        else:
+            print("WAKE_LOG: 未生成 Drive 凭据；云端必须已有有效的 Drive 挂载，否则部署将停止。", flush=True)
+
+        _upload_tunnel_config(contents, public_url, tunnel_token)
 
         print("WAKE_LOG: 正在云端配置 Google Drive 持久化、多模型引擎并启动隧道 (约需 40~90 秒)...", flush=True)
         boot_code = r"""
-import os, sys, time, re, shutil, subprocess
+import os, sys, time, re, shutil, subprocess, json, runpy
+
+redact_diagnostic = runpy.run_path("/content/easycolab_tunnel.py")["redact_diagnostic"]
+
+tunnel_stage = "/content/.easycolab_tunnel.json"
+if not os.path.isfile(tunnel_stage):
+    raise RuntimeError("隧道配置缺失，请重新唤醒部署 (missing tunnel configuration)")
+os.chmod(tunnel_stage, 0o600)
+try:
+    with open(tunnel_stage, encoding="utf-8") as tunnel_file:
+        tunnel_config = json.load(tunnel_file)
+finally:
+    os.remove(tunnel_stage)
+app_env = os.environ.copy()
+app_env.update(tunnel_config)
+custom_domain = bool(tunnel_config["EASYCOLAB_PUBLIC_URL"])
+diagnostic_secrets = (tunnel_config["CLOUDFLARE_TUNNEL_TOKEN"],)
 
 # 0. 配置无网页模式下的 Google Drive 云盘自动挂载/高速同步 (供模型库与 ComfyUI 节点持久化)
 rc_stage = "/content/.easycolab_rclone.conf"
@@ -545,41 +654,110 @@ if os.path.exists(rc_stage):
     shutil.move(rc_stage, rc_dst)
     os.chmod(rc_dst, 0o600)
 
-if os.path.exists(os.path.expanduser("~/.config/rclone/rclone.conf")):
-    if not shutil.which("rclone"):
-        subprocess.run(
-            ["bash", "-lc", "curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip && unzip -q -o /tmp/rclone.zip -d /tmp && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone && rm -rf /tmp/rclone*"],
-            check=False,
+def drive_mount_ready():
+    return os.path.isdir("/content/drive/MyDrive") and (
+        os.path.ismount("/content/drive") or os.path.ismount("/content/drive/MyDrive")
+    )
+
+def drive_mount_failure(stage, diagnostic="", external=False):
+    if "SERVICE_DISABLED" in diagnostic or "accessNotConfigured" in diagnostic or "quota project" in diagnostic:
+        reason = (
+            "Google Drive API 返回 403：当前 OAuth 项目未启用 Drive API 或缺少配额项目。"
+            "Colab 登录成功不代表 Drive 可用；请配置独立 drive-rclone.conf，或使用笔记本官方 Drive 挂载。"
         )
-    if shutil.which("rclone") and not os.path.ismount("/content/drive/MyDrive"):
-        subprocess.run(["rclone", "mkdir", "easycolab_gdrive:EasyColab_Drive"], check=False)
-        if os.path.exists("/dev/fuse") and (shutil.which("fusermount3") or shutil.which("fusermount")):
-            os.makedirs("/content/drive/MyDrive", exist_ok=True)
-            subprocess.Popen(
-                [
-                    "rclone", "mount", "easycolab_gdrive:EasyColab_Drive", "/content/drive/MyDrive",
-                    "--vfs-cache-mode", "writes",
-                    "--vfs-write-back", "3s",
-                    "--dir-cache-time", "15s",
-                    "--drive-chunk-size", "64M",
-                    "--buffer-size", "32M",
-                    "--allow-non-empty",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+    elif "invalid_grant" in diagnostic or "invalid_token" in diagnostic or "unauthorized_client" in diagnostic:
+        reason = "Drive 授权已失效，请重新授权独立 rclone Drive 配置后再部署。"
+    elif "fusermount3" in diagnostic and ("not found" in diagnostic or "No such file" in diagnostic):
+        reason = "缺少 FUSE3 挂载工具 fusermount3；旧版 fusermount 不能替代，请更新客户端后重新部署以自动安装 fuse3。"
+    else:
+        reason = (diagnostic if not external else "") or "请检查 Drive 授权、网络和云端 /content/easycolab_drive_mount.log 挂载日志。"
+    raise RuntimeError(f"Google Drive {stage}失败：{reason} 不会回退临时磁盘；已有实例未释放。")
+
+if not drive_mount_ready():
+    if not os.path.isfile(os.path.expanduser("~/.config/rclone/rclone.conf")):
+        drive_mount_failure("配置", "未找到 Drive 凭据，请配置独立 rclone Drive 授权或运行笔记本挂载步骤。")
+    if not os.path.exists("/dev/fuse"):
+        drive_mount_failure("挂载", "当前运行时缺少 /dev/fuse 设备，请使用支持 FUSE 挂载的运行时。")
+    if not shutil.which("fusermount3"):
+        if os.geteuid() != 0 or not shutil.which("apt-get"):
+            drive_mount_failure("安装 FUSE3", "缺少 fusermount3 且无法自动安装，请先安装 fuse3 系统包；旧版 fusermount 不能替代。")
+        print("WAKE_LOG: 正在安装 FUSE3 挂载依赖 (fusermount3)...", flush=True)
+        install_env = os.environ.copy()
+        install_env["DEBIAN_FRONTEND"] = "noninteractive"
+        try:
+            update_result = subprocess.run(
+                ["apt-get", "update", "-qq"], capture_output=True, text=True, env=install_env, timeout=90,
             )
-            for _ in range(10):
-                if os.path.ismount("/content/drive/MyDrive"):
-                    print("✅ 已通过 Google OAuth 自动挂载 Google Drive (/content/drive/MyDrive)！", flush=True)
-                    break
-                time.sleep(0.5)
-            else:
-                # 容器未开放 FUSE 挂载权限时清理空目录，由 app.py 自动启用 rclone 云盘高速双向同步
-                try:
-                    if not os.listdir("/content/drive/MyDrive"):
-                        os.rmdir("/content/drive/MyDrive")
-                except Exception:
-                    pass
+            if update_result.returncode:
+                drive_mount_failure("安装 FUSE3", "apt 软件源更新失败，请检查运行时出站网络及 apt 软件源。")
+            fuse_result = subprocess.run(
+                ["apt-get", "install", "-y", "--no-install-recommends", "fuse3"],
+                capture_output=True, text=True, env=install_env, timeout=90,
+            )
+        except subprocess.TimeoutExpired:
+            drive_mount_failure("安装 FUSE3", "apt 操作超时，请检查出站网络或等待其他包管理任务结束后再试。")
+        if fuse_result.returncode or not shutil.which("fusermount3"):
+            drive_mount_failure("安装 FUSE3", "fuse3 安装未成功或找不到 fusermount3，请检查 apt 包管理器状态后重试。")
+    if not shutil.which("rclone"):
+        install_result = subprocess.run(
+            ["bash", "-lc", "curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip && unzip -q -o /tmp/rclone.zip -d /tmp && cp /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone && rm -rf /tmp/rclone*"],
+            capture_output=True, text=True, timeout=90,
+        )
+        if install_result.returncode or not shutil.which("rclone"):
+            drive_mount_failure("安装 rclone", install_result.stderr, external=True)
+    print("WAKE_LOG: 正在验证 Google Drive API 访问权限...", flush=True)
+    try:
+        drive_probe = subprocess.run(
+            ["rclone", "mkdir", "easycolab_gdrive:EasyColab_Drive", "--retries", "1", "--low-level-retries", "1", "--contimeout", "10s", "--timeout", "20s"],
+            capture_output=True, text=True, timeout=35,
+        )
+    except subprocess.TimeoutExpired:
+        drive_mount_failure("API 检查", "Drive API 请求超时，请检查出站网络。")
+    if drive_probe.returncode:
+        drive_mount_failure("API 检查", drive_probe.stderr, external=True)
+    mount_path = "/content/drive/MyDrive"
+    os.makedirs(mount_path, exist_ok=True)
+    if os.listdir(mount_path):
+        drive_mount_failure("挂载", "挂载目录已有本地文件，请先备份并清空该目录；不会覆盖已有文件。")
+    mount_log_path = "/content/easycolab_drive_mount.log"
+    mount_log_fd = os.open(mount_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(mount_log_fd, "w") as mount_log:
+        os.chmod(mount_log_path, 0o600)
+        prepare_monitor = runpy.run_path("/content/easycolab_transfer.py")["prepare_mount_monitor"]
+        monitor_args, mount_env = prepare_monitor(mount_path, "easycolab_gdrive:EasyColab_Drive")
+        mount_process = subprocess.Popen(
+            [
+                "rclone", "mount", "easycolab_gdrive:EasyColab_Drive", mount_path,
+                "--vfs-cache-mode", "writes", "--vfs-write-back", "3s",
+                "--dir-cache-time", "15s", "--drive-chunk-size", "64M", "--buffer-size", "32M",
+            ] + monitor_args,
+            env=mount_env, stdout=mount_log, stderr=subprocess.STDOUT,
+        )
+        mount_env.clear()
+    try:
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if drive_mount_ready():
+                break
+            if mount_process.poll() is not None:
+                break
+            time.sleep(0.5)
+        if not drive_mount_ready():
+            with open(mount_log_path, errors="replace") as mount_log:
+                diagnostic = mount_log.read()[-4000:]
+            drive_mount_failure("挂载", diagnostic or "rclone 未在 45 秒内建立挂载。", external=bool(diagnostic))
+    except BaseException:
+        if mount_process.poll() is None:
+            mount_process.terminate()
+            try:
+                mount_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                mount_process.kill()
+                mount_process.wait(timeout=5)
+        raise
+
+app_env["EASYCOLAB_REQUIRE_DRIVE"] = "1"
+print("WAKE_LOG: ✅ Google Drive 挂载已验证；模型保存至 /content/drive/MyDrive/models。", flush=True)
 
 # 1. 如果尚未安装 DiffSynth-Studio，自动快速安装 (含最新 transformers 以支持 Qwen3.8-27B)
 if not os.path.exists("/content/DiffSynth-Studio"):
@@ -599,18 +777,21 @@ else:
 
 # 2. 检查是否已有运行中的 app.py 或 llama-server，先清理旧进程释放 GPU 显存
 subprocess.run(["pkill", "-f", "python.*/content/app.py"], check=False)
+subprocess.run(["pkill", "-f", "cloudflared.*--tag easycolab-main=1"], check=False)
 subprocess.run(["pkill", "-f", "llama-server"], check=False)
 time.sleep(1)
 
-# 3. 后台启动 /content/app.py 并等待 gradio.live 链接生成
+# 3. 后台启动 /content/app.py 并等待公网地址就绪
 log_path = "/content/easycolab_server.log"
 if os.path.exists(log_path):
     os.remove(log_path)
 
 with open(log_path, "w") as out_f:
-    subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", stdout=out_f, stderr=subprocess.STDOUT)
+    server_proc = subprocess.Popen([sys.executable, "-u", "/content/app.py"], cwd="/content", env=app_env, stdout=out_f, stderr=subprocess.STDOUT)
+app_env.pop("CLOUDFLARE_TUNNEL_TOKEN", None)
+tunnel_config.clear()
 
-url_re = re.compile(r"https://[a-zA-Z0-9.-]+\.gradio\.live")
+url_re = re.compile(r"^EASYCOLAB_READY_URL:(https://[^\s]+)$", re.MULTILINE)
 found_url = None
 for _ in range(90):
     time.sleep(2)
@@ -618,14 +799,32 @@ for _ in range(90):
         txt = open(log_path, "r", errors="replace").read()
         m = url_re.search(txt)
         if m:
-            found_url = m.group(0)
+            found_url = m.group(1)
             break
+    if server_proc.poll() is not None:
+        break
 
 if found_url:
     print("WAKE_URL:" + found_url, flush=True)
 else:
-    tail = open(log_path, "r", errors="replace").read()[-600:] if os.path.exists(log_path) else "no log"
-    print("WAKE_ERROR: 启动超时，日志尾部: " + tail, flush=True)
+    exit_code = server_proc.poll()
+    failure = f"服务进程退出 (exit={exit_code})" if exit_code is not None else "服务启动超时 (180s)"
+    if exit_code is None:
+        server_proc.terminate()
+        try:
+            server_proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            server_proc.kill()
+            server_proc.wait(timeout=5)
+            subprocess.run(["pkill", "-f", "cloudflared.*--tag easycolab-main=1"], check=False)
+    raw_log = open(log_path, "r", errors="replace").read() if os.path.exists(log_path) else "no log"
+    tail = redact_diagnostic(raw_log, diagnostic_secrets)[-6000:]
+    for log_line in tail.splitlines():
+        print("WAKE_LOG: " + log_line, flush=True)
+    detail = next((line for line in reversed(tail.splitlines()) if line.strip()), "no log")
+    mode = "自定义域名启动失败，不会回退随机地址" if custom_domain else "启动失败"
+    print(f"WAKE_ERROR: {mode}：{failure}。{detail}", flush=True)
+diagnostic_secrets = ()
 """
         def _on_kid(kid):
             target_session.kernel_id = kid
@@ -647,7 +846,7 @@ else:
                 on_session_started=_on_sid,
             )
             try:
-                return rt.execute_code(boot_code, allow_stdin=False, timeout=300)
+                return rt.execute_code(boot_code, allow_stdin=False, timeout=600)
             finally:
                 try:
                     rt.stop()
@@ -659,6 +858,7 @@ else:
         except Exception:
             target_session.kernel_id = None
             target_session.session_id = None
+            _upload_tunnel_config(contents, public_url, tunnel_token)
             outputs = _run_boot_on_runtime(use_saved_kernel=False)
 
         for out in outputs:
@@ -792,6 +992,11 @@ def main(argv=None):
     sub.add_parser("auth_status")
     sub.add_parser("auth_url")
     sub.add_parser("auth_logout")
+    sub.add_parser("drive_status")
+    drive_import = sub.add_parser("drive_import")
+    drive_import.add_argument("--client-json", required=True)
+    drive_connect = sub.add_parser("drive_connect")
+    drive_connect.add_argument("--full-access", action="store_true")
 
     p_code = sub.add_parser("auth_code")
     p_code.add_argument("code", type=str)
@@ -808,7 +1013,10 @@ def main(argv=None):
     sub.add_parser("stop_all")
 
     args = parser.parse_args(argv)
-    if args.cmd == "auth_status":
+    if args.cmd in {"drive_status", "drive_import", "drive_connect"}:
+        import easycolab_drive
+        easycolab_drive.run_command(args.cmd, getattr(args, "client_json", None), getattr(args, "full_access", False))
+    elif args.cmd == "auth_status":
         cmd_auth_status()
     elif args.cmd == "auth_url":
         cmd_auth_url()
