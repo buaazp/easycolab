@@ -1172,6 +1172,22 @@ def _make_timed_token_streamer(tokenizer, timeout: float = 120.0):
             self.generated_tokens = 0
             self.first_token_ts: Optional[float] = None
             self._saw_prompt = False
+            self.cancel_event = None
+
+        def __next__(self):
+            deadline = time.monotonic() + self.timeout if self.timeout is not None else None
+            while self.cancel_event is None or not self.cancel_event.is_set():
+                wait_seconds = 0.25 if deadline is None else min(0.25, max(0, deadline - time.monotonic()))
+                try:
+                    item = self.text_queue.get(timeout=wait_seconds)
+                except queue.Empty:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise
+                    continue
+                if item == self.stop_signal:
+                    raise StopIteration
+                return item
+            raise StopIteration
 
         def put(self, value):
             now = time.time()
@@ -6812,6 +6828,7 @@ class _GGUFStreamIterator:
         self.generated_tokens: int = 0
         self.first_token_ts: Optional[float] = None
         self._server_tps: float = 0.0
+        self.cancel_event = None
 
     def put_text(self, text: str, token_inc: int = 1):
         if not text:
@@ -6839,10 +6856,93 @@ class _GGUFStreamIterator:
         return self
 
     def __next__(self) -> str:
-        item = self._q.get()
-        if item is None:
-            raise StopIteration
-        return item
+        while self.cancel_event is None or not self.cancel_event.is_set():
+            try:
+                item = self._q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                raise StopIteration
+            return item
+        raise StopIteration
+
+
+SSE_HEARTBEAT_SECONDS = 5.0
+
+
+def _next_sse_frame(iterator):
+    try:
+        return True, next(iterator)
+    except StopIteration:
+        return False, ""
+
+
+async def _stream_sse_events(iterator, cancel_event, protocol, request_id):
+    pending = None
+    started_at = time.monotonic()
+    frames_sent = 0
+    heartbeats_sent = 0
+    outcome = "disconnected"
+    error_type = None
+
+    def close_iterator(finished=None):
+        if finished is not None and not finished.cancelled():
+            finished.exception()
+        try:
+            iterator.close()
+        except Exception:
+            pass
+
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.create_task(asyncio.to_thread(_next_sse_frame, iterator))
+            completed = (await asyncio.wait({pending}, timeout=SSE_HEARTBEAT_SECONDS))[0]
+            if not completed:
+                heartbeats_sent += 1
+                yield 'event: ping\ndata: {"type":"ping"}\n\n' if protocol == "anthropic" else ": keep-alive\n\n"
+                continue
+            finished, pending = pending, None
+            has_frame, frame = finished.result()
+            if not has_frame:
+                outcome = "completed"
+                break
+            frames_sent += 1
+            yield frame
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        outcome = "error"
+        error_type = type(error).__name__
+        payload = {"error": {
+            "type": "api_error" if protocol == "anthropic" else "server_error",
+            "code": "upstream_generation_error",
+            "message": "Generation interrupted; partial output is incomplete. Check the server log using request_id. Do not automatically replay this request.",
+        }, "request_id": request_id}
+        if protocol == "anthropic":
+            payload["type"] = "error"
+        prefix = "event: error\n" if protocol == "anthropic" else ""
+        yield prefix + "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+    finally:
+        cancel_event.set()
+        if pending is not None:
+            pending.add_done_callback(close_iterator)
+        else:
+            close_iterator()
+        print("[API stream] " + json.dumps({
+            "request_id": request_id, "protocol": protocol, "outcome": outcome,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "frames": frames_sent, "heartbeats": heartbeats_sent, "error_type": error_type,
+        }), flush=True)
+
+
+def _sse_response(iterator, streamer, cancel_event, protocol, request_id):
+    streamer.cancel_event = cancel_event
+    return StreamingResponse(
+        _stream_sse_events(iterator, cancel_event, protocol, request_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "X-Request-ID": request_id},
+    )
 
 
 def _pil_to_jpeg_data_url(im: Image.Image) -> str:
@@ -7475,6 +7575,7 @@ def attach_macos_api_routes(app: FastAPI):
 
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:20]}"
         created_ts = int(time.time())
+        print(f"[OpenAI API] request_id={cmpl_id} | backend={bundle.get('backend')} | stream={stream}")
 
         def _openai_nonstream_response():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
@@ -7571,6 +7672,8 @@ def attach_macos_api_routes(app: FastAPI):
                         }
                         yield f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n"
 
+                if err_box[0] is not None:
+                    raise err_box[0]
                 tail_events, tool_calls = parser.finish()
                 for kind, val in tail_events:
                     if not val:
@@ -7627,11 +7730,7 @@ def attach_macos_api_routes(app: FastAPI):
             yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(
-            _openai_sse_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
+        return _sse_response(_openai_sse_stream(), streamer, cancel_event, "openai", cmpl_id)
 
     @app.post("/v1/images/generations")
     @app.post("/images/generations")
@@ -7768,6 +7867,7 @@ def attach_macos_api_routes(app: FastAPI):
         )
 
         msg_id = f"msg_{uuid.uuid4().hex[:22]}"
+        print(f"[Anthropic API] request_id={msg_id} | backend={bundle.get('backend')} | stream={stream}")
 
         def _anthropic_nonstream_response():
             parser = _IncrementalQwenStreamParser(start_in_thinking=start_in_thinking)
@@ -7914,6 +8014,8 @@ def attach_macos_api_routes(app: FastAPI):
                             {"type": "content_block_delta", "index": active_block_idx, "delta": delta_obj},
                         )
 
+                if err_box[0] is not None:
+                    raise err_box[0]
                 tail_events, tool_calls = parser.finish()
                 for kind, val in tail_events:
                     if not val:
@@ -7995,11 +8097,7 @@ def attach_macos_api_routes(app: FastAPI):
             )
             yield _anthropic_sse_event("message_stop", {"type": "message_stop"})
 
-        return StreamingResponse(
-            _anthropic_sse_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-        )
+        return _sse_response(_anthropic_sse_stream(), streamer, cancel_event, "anthropic", msg_id)
 
     @app.post("/minimax_api/download_model")
     def api_download_model(req: DownloadModelRequest):

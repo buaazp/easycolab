@@ -278,6 +278,22 @@ Custom mode disables Gradio public sharing and returns the fixed URL after the c
 
 Official references: [Create a remotely-managed Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) · [Run parameters and tokens](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/).
 
+### Open WebUI / Magpie Streaming Disconnects
+
+`EasyColab: connection lost mid-reply (http2: client connection lost)` is a relay-client HTTP/2 transport error, not model output or a model-list error. For Open WebUI → Magpie → Cloudflare → EasyColab, inspect Magpie's logs as well as Colab's GPU. Go emits this error when an HTTP/2 PING health check fails, interrupting requests on the shared connection. The message alone cannot identify whether a local proxy, packet loss or an edge node caused the missing response. Cloudflare `524` and BIC `1010` are separate issues.
+
+- **Use HTTP/1.1 for this provider**: Magpie → EasyColab → Advanced → HTTP version → HTTP/1.1 only → Save. Keep HTTPS, certificate validation and API-key authentication enabled. Do not disable HTTP/2 zone-wide or turn off certificate checks. This avoids HTTP/2 health-check/shared-connection failure modes, not every network outage.
+- **Server heartbeats**: while waiting for output, OpenAI streams emit an SSE `: keep-alive` comment every five seconds; Anthropic streams emit a `ping` event. This also covers queueing, prefill and tool-call assembly. Heartbeats do not contribute text or tokens. Responses use `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no`, without the hop-by-hop `Connection` header prohibited by HTTP/2. An additional Nginx proxy must still disable response buffering for API routes and use an appropriate read timeout.
+- **Failures are not success**: generation failures emit `upstream_generation_error` without a successful `stop`, `[DONE]` or `message_stop`. A disconnected client promptly signals cancellation and allows waiting iterators to exit. Partially delivered requests are never automatically replayed, avoiding duplicated answers or tool side effects.
+- **Request correlation**: match the response's `X-Request-ID` with `request_id` in Colab's `[API stream]` logs. Terminal states are `completed`, `disconnected` or `error`, with duration, frame/heartbeat counts and exception type, never prompts, full answers or credentials. `completed` means the origin finished emitting, not that every intermediary delivered everything to the client.
+- **Non-streaming tasks differ**: Open WebUI's title, tag or search-suggestion tasks may send `stream:false` and contend with conversation requests for the serialized GPU. SSE heartbeats cannot keep an ordinary JSON response alive. Review auxiliary-task model selection, output limits and thinking settings; use a faster task model where appropriate. Raising only Open WebUI's client timeout cannot override Cloudflare's origin timeout.
+
+Redeploy the bundled server resources to activate server changes. Changing Magpie's HTTP/1.1 setting alone does not restart Colab. For remaining failures, record client time, request ID, HTTP status and the matching Colab terminal state, never API keys.
+
+Local verification on 2026-11-10: after enabling this provider's HTTP/1.1 option, both a short request and an 854-output-token request through Magpie reached `[DONE]`; this is not a long-term stability guarantee. New server behavior passed isolated OpenAI/Anthropic regressions and real TCP heartbeat/disconnect tests. The running GPU service was not hot-patched or restarted; public-path heartbeat verification requires redeployment.
+
+References: [SSE heartbeats and message format](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events), [Magpie per-provider HTTP/1.1](https://github.com/yetone/magpie/blob/v0.1.3351/internal/netproxy/http1.go), [HTTP/2 health checks](https://github.com/yetone/magpie/blob/v0.1.3351/internal/netproxy/netproxy.go).
+
 ---
 
 ## Privacy & Security Best Practices

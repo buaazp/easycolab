@@ -286,6 +286,22 @@ rclone 默认将真实云盘的 **`MyDrive/EasyColab_Drive`** 挂到 `/content/d
 
 官方参考：[创建远程管理 Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/) · [连接器参数与 Token](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/run-parameters/)。
 
+### Open WebUI / Magpie 流式断连
+
+`EasyColab: connection lost mid-reply (http2: client connection lost)` 是中转客户端的 HTTP/2 传输错误，不是模型输出或模型列表错误。实际链路若为 Open WebUI → Magpie → Cloudflare → EasyColab，先看 Magpie 日志，而不是仅看 Colab GPU。Go 的该错误由 HTTP/2 PING 健康检查失败触发，会中断共享连接上的请求；仅凭错误不能判定是本地代理、链路丢包还是边缘节点没有及时响应。它与 Cloudflare 的 `524`、BIC 的 `1010` 是不同问题。
+
+- **按供应商使用 HTTP/1.1**：Magpie → EasyColab → 高级 → HTTP 版本 →「仅 HTTP/1.1」→ 保存。只调整该 Provider，保留 HTTPS、证书校验和 API Key；不必关闭整个站点的 HTTP/2，也不要通过关闭 TLS 校验解决传输断连。该选项绕开 HTTP/2 保活/共享连接故障模式，但不能修复所有网络中断。
+- **服务端心跳**：OpenAI 流在等待输出时每 5 秒发 SSE 注释 `: keep-alive`；Anthropic 流发 `ping` 事件。排队、prefill、工具调用组装期间也能保持连接活跃，心跳不计入文本或 token。响应携带 `Cache-Control: no-cache, no-transform`、`X-Accel-Buffering: no`，不发送 HTTP/2 禁止的逐跳 `Connection` 头。自建 Nginx 仍需针对 API 关闭响应缓冲，并设置合理的读取超时。
+- **中断不会伪装成功**：推理失败发送 `upstream_generation_error`，不再补发成功的 `stop` / `[DONE]` / `message_stop`；客户端断开会及时设置取消信号，等待中的迭代器可退出。不会自动重放已经部分输出的请求，以免重复答案或工具副作用。
+- **定位请求**：响应头 `X-Request-ID` 对应 Colab 日志 `[API stream]` 中的 `request_id`；终态区分 `completed`、`disconnected`、`error`，记录耗时、帧数、心跳数和异常类型，不记录提示词、完整回复或密钥。`completed` 只代表源站输出结束，不保证经过所有中间节点后客户端也收全。
+- **非流式任务另行处理**：Open WebUI 的标题、标签或搜索建议等后台任务可能发送 `stream:false`，并与对话串行争用 GPU。SSE 心跳不适用于普通 JSON 响应；长时间思考的辅助任务仍可能触发代理超时。检查这些任务的模型、输出上限和思考设置，必要时选择更快的任务模型。盲目增大 Open WebUI 客户端超时不能突破 Cloudflare 的源站超时。
+
+服务端改动需要重新部署打包后的资源才生效；仅切换 Magpie 的 HTTP/1.1 不需要重启 Colab。排查仍失败时同时记录客户端时间、请求 ID、HTTP 状态和 Colab 对应终态，不要发送 API Key。
+
+2026-11-10 本机验证：启用该 Provider 的 HTTP/1.1 后，经 Magpie 的短请求及一条 854 输出 token 的请求均完整收到 `[DONE]`；这不是长时间稳定性保证。服务端新增行为通过隔离的 OpenAI/Anthropic 回归及真实 TCP 心跳/断开测试，运行中的 GPU 服务未热替换或重启，心跳代码需要下次部署后才能在公网验证。
+
+依据：[SSE 心跳与消息格式](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events)、[Magpie 按 Provider 强制 HTTP/1.1](https://github.com/yetone/magpie/blob/v0.1.3351/internal/netproxy/http1.go)、[HTTP/2 健康检查配置](https://github.com/yetone/magpie/blob/v0.1.3351/internal/netproxy/netproxy.go)。
+
 ---
 
 ## 隐私与安全建议
