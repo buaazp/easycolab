@@ -37,6 +37,24 @@
 
 ## 快速开始
 
+### 在另一台电脑用浏览器启停 Penny Royal
+
+使用独立的 [`EasyColab_Control.ipynb`](EasyColab_Control.ipynb)，不是旧的 `EasyColab_Server.ipynb`。它是自包含的控制笔记本，不要求家里的电脑安装 App 或配置 rclone。
+
+1. 在 [Google Colab](https://colab.research.google.com/) 选择「文件 → 上传笔记本」，上传 `EasyColab_Control.ipynb`，再「文件 → 在云端硬盘中保存副本」，收藏你自己的副本链接。
+2. 登录存放模型的同一个 Google 账号；在「代码执行程序 → 更改运行时类型」选择 **G4 / RTX PRO 6000 96GB**，点击「连接」。Colab 仍负责分配 GPU，受账号额度和可用机型限制。
+3. 左侧 Secrets 添加并授权 `CLOUDFLARE_TUNNEL_TOKEN`、`EASYCOLAB_API_KEY`。后者可以复用桌面 App 的 API Key。不要把密钥写进笔记本代码；也无需上传 rclone 授权文件。
+4. 顺序运行三个代码单元格，完成官方 Drive 授权。在面板填入固定域名，确认模型目录，按 **① 准备环境 → ② 启动 API → ③ 加载模型** 操作。「查看状态」显示 `loaded: true` 后可使用完整的 jpezzulli ModelOpt 模型 ID；API Base URL 为 `https://你的域名/v1`。
+5. 用完勾选「确认释放当前笔记本 GPU」，点击红色 **释放 GPU 实例**。只关闭网页或「卸载模型」仍会消耗额度。若面板不可用，用 Colab「代码执行程序 → 管理会话」终止对应实例。
+
+默认读取真实 Drive 的 `MyDrive/EasyColab_Drive/models`，与桌面 App 的持久化位置一致；若此前使用官方笔记本存到了 `MyDrive/models`，请修改面板目录。云盘权重只读，先校验固定版本清单与文件大小，再复制到独立 SSD 缓存；完整的本地权重会复用，不下载 126 GiB 权重，也不自动删除旧 vLLM 缓存。权重缺失时请先用桌面端补齐。
+
+本模式只提供 Penny Royal 的 API 和受密钥保护的控制接口，不提供旧 MiniMax 网页或完整桌面管理端点。控制笔记本在 GitHub 固定提交 `94b32ca` 上下载并 SHA256 校验网关模块，复用 SSE 心跳修复和已有 SGLang 后端。首次准备在 Colab Ubuntu 24.04 / Python 3.12 安装 CUDA 13.3 工具包、GCC14、Rust及独立 Python 环境，**不升级 GPU 驱动**；释放实例后仍需重新准备环境和读取 Drive 权重。
+
+**同一域名不要同时连接两台实例到相同 Tunnel**，否则请求可能被分发到不同服务器。请先停止旧 EasyColab 实例。默认 API 服务闲置 30 分钟自动释放；准备环境期间尚无看门狗，请勿遗留未使用的 GPU。「运行全部」仅挂载 Drive 并显示面板，不自动编译、加载或释放。
+
+验证范围：固定源码下载与哈希、模型路径与复用、路由鉴权、加载/卸载和失败清理使用隔离测试验证；不会为了验证释放按钮而销毁用户正在使用的实例。Google OAuth 弹窗及新实例全量安装仍需在用户自己的 Colab 笔记本执行。
+
 ### 新增实验后端：ModelOpt NVFP4 / SGLang · Penny Royal
 
 模型列表中新增 **OrcaRouter Flash-Next ModelOpt · Penny Royal**，与原来的 `orcarouter/...-NVFP4` vLLM 模型并存，不修改旧权重、旧 vLLM 环境或启动参数。

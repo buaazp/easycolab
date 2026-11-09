@@ -36,6 +36,21 @@ Optimized out of the box for **Google Colab G4 (`NVIDIA RTX PRO 6000 Blackwell` 
 
 ## Quick Start
 
+### Browser Controls from Another Computer
+
+Use the standalone [`EasyColab_Control.ipynb`](EasyColab_Control.ipynb), not the legacy `EasyColab_Server.ipynb`. Upload it at [Google Colab](https://colab.research.google.com/), save a copy to your Drive, and bookmark your copy. No desktop app or local rclone authorization is needed.
+
+1. Sign in to the Google account holding your weights. Choose **Runtime → Change runtime type → G4 / RTX PRO 6000 96GB**, then Connect. GPU allocation still depends on Colab quota and availability.
+2. Add `CLOUDFLARE_TUNNEL_TOKEN` and `EASYCOLAB_API_KEY` in Colab Secrets and grant this notebook access. The API key may match your desktop key. Never paste credentials into notebook source or upload rclone credentials.
+3. Run the three code cells in order and authorize the official Drive mount. Fill in your HTTPS hostname and model directory, then click **Prepare Environment → Start API → Load Model**. Wait for status `loaded: true`; use the full jpezzulli ModelOpt repository ID and `https://your-hostname/v1` in your API client.
+4. When finished, confirm and click the red **Release GPU** button. Unloading the model or closing the browser does not release the instance. If the panel is unavailable, terminate the corresponding session through **Runtime → Manage sessions**.
+
+The default reads `MyDrive/EasyColab_Drive/models`, matching desktop persistence. Change it to `MyDrive/models` if that is where your old official notebook stored the checkpoint. Cloud weights are read-only: the controller validates the pinned manifest and sizes, stages to local SSD, and reuses complete local shards. It does not redownload 126 GiB or delete old vLLM caches. Missing weights must first be completed using the desktop workflow.
+
+This mode exposes the Penny Royal API and authenticated control routes, not the legacy MiniMax WebUI or all desktop management endpoints. It downloads and SHA256-verifies gateway modules from fixed EasyColab commit `94b32ca`, including SSE fixes, and reuses the existing SGLang backend. First preparation targets Colab Ubuntu 24.04 / Python 3.12, installs CUDA Toolkit 13.3, GCC14, Rust and isolated Python environments, without upgrading the GPU driver. Releasing the instance loses the toolchain and SSD cache.
+
+Stop any old instance using the same Cloudflare Tunnel before starting another, otherwise requests may reach different servers. The API defaults to release after 30 idle minutes; environment preparation has no idle watchdog yet. Run All mounts Drive and displays controls but never automatically builds, loads or releases. Isolated checks cover sources, paths, reuse, authentication and lifecycle; Google consent and a complete fresh-runtime installation require the user's Colab session. Testing never releases the user's live GPU.
+
 ### Experimental ModelOpt NVFP4 Backend: SGLang / Penny Royal
 
 The catalog now includes **OrcaRouter Flash-Next ModelOpt · Penny Royal** alongside the existing `orcarouter/...-NVFP4` vLLM model. Existing weights, vLLM runtime and launch options remain unchanged.
